@@ -1,0 +1,15 @@
+{
+  "_entry_point": "regulatory_batch_audit",
+  "_description": "Auditor requests batch chain-of-custody \u2014 assemble traceability dossier.",
+  "payload": {
+    "audit_id": "audit-fda-2026-Q2",
+    "auditor": "FDA Inspectorate \u2014 Region 3",
+    "batch_ids_requested": [
+      "batch-2026-W19-0042",
+      "batch-2026-W20-0031",
+      "batch-2026-W21-0018"
+    ],
+    "deadline_utc": "2026-06-12T17:00:00Z",
+    "scope": "Full chain-of-custody \u2014 raw materials, processing parameters, QC records, ship records."
+  }
+}

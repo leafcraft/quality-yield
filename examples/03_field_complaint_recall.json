@@ -1,0 +1,12 @@
+{
+  "_entry_point": "field_complaint",
+  "_description": "Customer-reported defect \u2014 recall_traceability_agent finds the production lot, scopes the recall.",
+  "payload": {
+    "complaint_id": "fc-2026-0604-002",
+    "customer_id": "c-acme-mfg",
+    "product_sku": "PROD-VALVE-128",
+    "serial_number": "VLV-128-2026-04-018273",
+    "defect_description": "Internal seal failure at 60% rated pressure \u2014 pressure test record attached.",
+    "potential_impact": "high"
+  }
+}

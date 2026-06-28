@@ -1,0 +1,859 @@
+# quality-yield — Quality & Yield (inspection / root-cause / corrective)
+#
+# qual × goods ROI cell — pool 10% revenue, routine 70%, internal vis.
+# Scrap and rework cost material and labor; catching defects in-line
+# removes that loss.
+
+name: "quality-yield"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 604800
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    Quality inspection mesh. Successful turn:
+      - inspection_intake_agent normalises camera / SPC / complaint
+        event AND classifies + scores the defect
+      - quality_engineer correlates root cause (process, supplier,
+        batch) AND drafts the CAPA
+      - qa_manager reviews batch-release decision
+      - audit logs every batch decision
+
+    Escalate when:
+      - defect_rate > 3 sigma over rolling 24h on any line
+      - root_cause unresolvable (multi-source contributions)
+      - safety-critical defect class (FDA / CE / customer-injury risk)
+
+  routing:
+    mode: "learning"
+    memory_size: 200
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "quality_runbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "plant_engineer_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{batch_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_QA_CHANNEL:}"
+        message_template: "[qa] {{message}} — batch {{batch_id}}"
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+data_structures:
+  QAEvent:
+    type: "object"
+    properties:
+      batch_id: { type: "string" }
+      line_id: { type: "string" }
+      source: { type: "string" }              # vision | spc | complaint | scheduled
+      received_at_utc: { type: "string" }
+    required: ["batch_id", "source"]
+
+entry_points:
+  - name: "vision_event"
+    target: "inspection_intake_agent"
+    description: "Vision-system defect candidate"
+
+  - name: "spc_out_of_control"
+    target: "inspection_intake_agent"
+    description: "SPC out-of-control signal"
+
+  - name: "customer_complaint"
+    target: "inspection_intake_agent"
+    description: "Customer complaint webhook (field failure)"
+
+  - name: "scheduled_batch_inspection"
+    target: "spc_monitor_agent"
+    description: "Cron — periodic SPC sweep + chart computation"
+
+  - name: "manual_action"
+    target: "inspection_intake_agent"
+    description: "QA-initiated review"
+
+  - name: "spc_measurement_ingest"
+    target: "spc_monitor_agent"
+    description: "Record one SPC measurement"
+
+  - name: "spc_check"
+    target: "spc_monitor_agent"
+    description: "Compute SPC chart + out-of-control signals"
+
+  - name: "capa_open"
+    target: "corrective_action_tracker_agent"
+    description: "Open a new corrective action"
+
+  - name: "capa_update"
+    target: "corrective_action_tracker_agent"
+    description: "Update CAPA status / verification"
+
+  - name: "capa_report"
+    target: "corrective_action_tracker_agent"
+    description: "Report CAPA register state — overdue, effectiveness"
+
+  - name: "field_complaint"
+    target: "recall_traceability_agent"
+    description: "Customer-reported defect — trace batch + scope recall"
+
+  - name: "regulatory_batch_audit"
+    target: "recall_traceability_agent"
+    description: "Auditor requests batch chain-of-custody — assemble traceability dossier"
+
+  - name: "internal_qa_review"
+    target: "recall_traceability_agent"
+    description: "Internal QA monthly review — sample batches for traceability completeness"
+
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_inspection_intake"
+    target: "inspection_intake_agent"
+    description: "On-demand direct call to inspection_intake (llm, normalise + classify) — bypasses upstream chain"
+
+  - name: "direct_call_quality_engineer"
+    target: "quality_engineer_agent"
+    description: "On-demand direct call to quality_engineer (llm, root cause + CAPA draft) — bypasses upstream chain"
+
+  # ── Lyzr-inspired agents (added in 2.3.x) ──
+  - name: "orchestrate_recall"
+    target: "recall_traceability_agent"
+    description: "Safety-critical defect + units-in-market → coordinate customer notify + regulator filings + batch freeze"
+
+  - name: "regulatory_audit_readiness"
+    target: "regulatory_compliance_agent"
+    description: "Per-framework audit-readiness scorecard (FDA 21CFR11, ISO 13485, EU MDR, GMP, ISO 22000)"
+
+
+agents:
+
+  # ────────────────────────────────────────────────────────────
+  # inspection_intake_agent — normalise + classify (LLM + module)
+  # The LLM normalises + classifies; agency/inspection_intake_agent.py
+  # adds the deterministic depth a prompt can't guarantee:
+  #   @pre_compose  pull the batch genealogy (+ lots + prior recalls)
+  #                 so the classifier knows the spec + safety flag.
+  #   @chain        the DEFECT-SEVERITY / QUARANTINE GATE + the
+  #                 SAFETY-CRITICAL HARD-STOP — severity >= 0.6 or a
+  #                 safety-critical class/batch forces quarantine; the
+  #                 LLM cannot pass a severe defect. Fires on direct
+  #                 calls too (it lives in the @chain).
+  #   @compose      per-downstream payloads (engineer / manager /
+  #                 inspector each need different fields).
+  # The qa_manager_human wire condition mirrors the gate as defence
+  # in depth.
+  # ────────────────────────────────────────────────────────────
+  inspection_intake_agent:
+    name: "inspection_intake_agent"
+    agent_type: "llm"
+    description: "Normalises any inspection signal into QAEvent, then classifies defect class + severity"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1000
+    communication_type: "chain"
+    prompt: |
+      Process the inspection signal in two stages.
+
+      Stage 1 — NORMALISE into the canonical shape. Identify
+      batch_id and line_id from the source payload.
+
+      Stage 2 — CLASSIFY the defect.
+
+      Return JSON with these keys (all required):
+        - batch_id: string
+        - line_id: string
+        - source: string
+        - raw_signal: object
+        - defect_class: dimensional | cosmetic | functional | safety_critical | none
+        - severity: 0..1
+        - confidence: 0..1
+        - quarantine_recommended: true if severity >= 0.6 OR class is safety_critical
+        - qa_briefing: 3 sentence narrative for QA. Lead with defect
+          class + severity. Note the specific defect signature
+          (dimensional out-of-tolerance, scratch length, etc.).
+          Recommend quarantine vs pass with rationale.
+
+      Hard rules (fail-closed quarantine / severity floors — apply
+      AFTER your own judgement, never relax them). NOTE: these same
+      floors are RE-ASSERTED deterministically by the agency module's
+      @chain (defect-severity / quarantine gate + safety-critical
+      hard-stop) — you cannot waive them:
+        - "defect_class" MUST be one of: dimensional | cosmetic |
+          functional | safety_critical | none
+        - safety_critical → "quarantine_recommended" MUST be true and
+          "severity" MUST be 1.0 unless specific evidence supports a
+          value of at least 0.8
+        - "severity" >= 0.6 → "quarantine_recommended" MUST be true
+        - always echo "batch_id" — downstream reviewers must know
+          WHICH batch on every path
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"batch_id": "", "line_id": "", "source": "", "raw_signal": {}, "defect_class": "", "severity": 0, "confidence": 0, "quarantine_recommended": false, "qa_briefing": ""}
+      ("safety_hard_stop" is stamped by the agency @chain — leave it out.)
+    enforce_yields: true
+    enforce_yields_retry: 2
+    # knowledge: defect_taxonomy kept from the absorbed classifier
+    # (intake stage had no knowledge group; classification is the
+    # stage that needs KB context).
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "defect_taxonomy"
+    yields:
+      batch_id: "string"                # identity passthrough
+      line_id: "string"
+      source: "string"
+      raw_signal: "object"
+      defect_class: "string"
+      severity: "number"
+      confidence: "number"
+      quarantine_recommended: "boolean"
+      qa_briefing: "string"
+      safety_hard_stop: "boolean"        # stamped by the @chain hard-stop
+    inputs:
+      payload: "object"
+      source_event_id: "string"          # resolves the seeded defect record
+      upstream_yields: "object"
+    can_call:
+      - agent: "quality_engineer_agent"
+        condition: "calling_agent_response.defect_class != 'none'"
+
+      # Forced-quarantine wire — hard policy lives BOTH in the prompt
+      # hard rules and here (the floors the deleted module enforced:
+      # severity >= 0.6 or safety_critical → quarantine review by the
+      # batch-release authority, even if the model under-calls
+      # quarantine_recommended).
+      - agent: "qa_manager_human"
+        condition: "calling_agent_response.quarantine_recommended == true or calling_agent_response.severity >= 0.6 or calling_agent_response.defect_class == 'safety_critical'"
+
+      # First-line verification wire — a REAL but low-severity defect
+      # (not quarantine, not safety-critical) goes to the QA inspector
+      # for first-line check before it reaches the batch-release
+      # authority. Mutually exclusive with the quarantine gate above so
+      # a defect lands with exactly one human role.
+      - agent: "qa_inspector_human"
+        condition: "calling_agent_response.defect_class != 'none' and calling_agent_response.quarantine_recommended == false and calling_agent_response.severity < 0.6 and calling_agent_response.defect_class != 'safety_critical'"
+
+    narration: >
+      If the same line keeps producing the same defect signature
+      across batches, also consider spc_monitor_agent for a chart
+      check before the next batch runs.
+
+  # ────────────────────────────────────────────────────────────
+  # quality_engineer_agent — root cause + CAPA draft (LLM + module)
+  # The LLM correlates root cause(s) and drafts the CAPA narrative;
+  # agency/quality_engineer_agent.py adds the deterministic depth:
+  #   @pre_compose  pull the recent SPC window for the line, the
+  #                 incoming lots (a bad CoA → supplier cause) and the
+  #                 OPEN CAPAs already on the line (don't duplicate).
+  #   @chain        the CAPA-REQUIRED floor — a multi-source cause, a
+  #                 safety-critical defect, or an out-of-spec lot MUST
+  #                 carry a CAPA + engineer review; multi_source is set
+  #                 from the cause count, not the model. Fires on direct
+  #                 calls too.
+  # ────────────────────────────────────────────────────────────
+  quality_engineer_agent:
+    name: "quality_engineer_agent"
+    agent_type: "llm"
+    description: "Correlates defect to root cause (process / supplier / batch), then drafts the CAPA"
+    model: "claude-sonnet-4-6"
+    temperature: 0.1
+    max_completion_tokens: 2000
+    communication_type: "chain"
+    thinking: true
+    thinking_budget: 4096
+    prompt: |
+      You are the quality engineer for this line. Work the defect in
+      two responsibilities, in order.
+
+      Responsibility 1 — ROOT CAUSE ANALYSIS. Identify root cause(s)
+      for this defect. Possible causes:
+        - process: setpoint drift, tool wear, calibration
+        - supplier: incoming material variance
+        - batch: contamination, mixing error
+        - environmental: temp/humidity excursion
+      Cite the supporting evidence per cause; return top 1-3.
+
+      Responsibility 2 — CAPA DRAFT. Draft a Corrective + Preventive
+      Action (CAPA) addressing the primary cause you found:
+        - immediate_corrective_action
+        - preventive_action
+        - target_completion_utc
+        - responsible_role
+      The CAPA goes to qa_manager_human for review — NEVER auto-applied.
+
+      Return JSON with these keys (all required):
+        - root_causes: list of {cause, evidence, confidence}
+        - primary_cause: string
+        - multi_source: boolean
+        - requires_engineer_review: boolean
+        - immediate_corrective_action: string
+        - preventive_action: string
+        - target_completion_utc: string
+        - responsible_role: string
+
+      Hard rules (deterministic policy — RE-ASSERTED by the agency
+      module's @chain CAPA-required floor; you cannot relax them):
+        - every cause MUST be one of: process | supplier | batch |
+          environmental — discard anything else
+        - "multi_source" MUST be true when you return 2 or more
+          root causes
+        - "requires_engineer_review" MUST be true whenever
+          "multi_source" is true
+        - "primary_cause" is the highest-confidence cause, or ""
+          when no valid cause was found
+        - always echo "batch_id" from the upstream defect —
+          plant_engineer_human / qa_manager_human must know WHICH
+          batch the analysis + CAPA cover
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"root_causes": [], "primary_cause": "", "multi_source": false, "requires_engineer_review": false, "immediate_corrective_action": "", "preventive_action": "", "target_completion_utc": "", "responsible_role": "", "batch_id": ""}
+      ("capa_required" / "linked_open_capa_id" are stamped by the agency
+      @chain from the open CAPA register — leave them out.)
+    enforce_yields: true
+    enforce_yields_retry: 2
+    # knowledge: root_cause_patterns kept from the absorbed analyzer —
+    # cause correlation is the judgment stage that needs KB context;
+    # the CAPA structure is fully specified in the prompt.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "root_cause_patterns"
+    yields:
+      root_causes: "list"               # [{cause, evidence, confidence}]
+      primary_cause: "string"
+      multi_source: "boolean"
+      requires_engineer_review: "boolean"
+      immediate_corrective_action: "string"
+      preventive_action: "string"
+      target_completion_utc: "string"
+      responsible_role: "string"
+      batch_id: "string"                # identity passthrough — plant_engineer_human / qa_manager_human inputs
+      capa_required: "boolean"          # stamped by the @chain CAPA-required floor
+      linked_open_capa_id: "string"     # existing open CAPA the @chain linked (dedupe)
+    inputs:
+      batch_id: "string"
+      line_id: "string"
+      defect_class: "string"
+      safety_hard_stop: "boolean"
+      upstream_yields: "object"
+    can_call:
+      - agent: "plant_engineer_human"
+        condition: "calling_agent_response.multi_source == true or calling_agent_response.requires_engineer_review == true"
+
+      # CAPA review edge from the absorbed drafter — gated by the
+      # former internal-edge condition so escalated (multi-source /
+      # engineer-review) defects route to plant_engineer only, as before.
+      - agent: "qa_manager_human"
+        condition: "calling_agent_response.multi_source == false and calling_agent_response.requires_engineer_review == false"
+
+  # ────────────────────────────────────────────────────────────
+  # spc_monitor_agent — SPC chart maths (Python — domain math)
+  #   @pre_compose  pull the measurement WINDOW for the line from the
+  #                 source store (the plant historian in prod).
+  #   body+@chain   X-bar / UCL / LCL + Western Electric out-of-control
+  #                 rules (agency/_shared/spc_math.py) — deterministic
+  #                 statistics that must not be hallucinated. The @chain
+  #                 SPC-out-of-control floor recomputes the chart and
+  #                 flags requires_qa_action / out_of_control_lines so
+  #                 the plant-engineer route fires; holds on direct calls.
+  #
+  # Measurements arrive from your PLANT HISTORIAN (PI, Ignition,
+  # InfluxDB, …) — feed `spc_measurement_ingest` from the historian,
+  # or swap this agent to an mcp connector following the
+  # ${HISTORIAN_MCP_URL:} pattern. The dev store SPC series
+  # (agency/_shared/store.py) is the chart-window stand-in, seeded with
+  # an out-of-control point so the floor fires on day 0 — never your
+  # system of record.
+  # ────────────────────────────────────────────────────────────
+  spc_monitor_agent:
+    name: "spc_monitor_agent"
+    agent_type: "programmatic"
+    description: "Daily SPC sweep (3-sigma excursions) + X-bar / R chart with Western Electric out-of-control rules"
+    communication_type: "execute"
+    wake_up: "0 6 * * *"
+    yields:
+      lines_swept: "number"
+      out_of_control_lines: "list"
+      mode: "string"
+      line_id: "string"
+      characteristic: "string"
+      samples: "number"
+      x_bar: "number"
+      sigma: "number"
+      ucl: "number"
+      lcl: "number"
+      out_of_control_signals: "list"
+      requires_qa_action: "boolean"
+      spc_briefing: "string"
+    inputs:
+      trigger: "string"
+      mode: "string"
+      line_id: "string"
+      characteristic: "string"
+      value: "number"
+      sample_size: "number"
+      window: "number"
+    can_call:
+      - agent: "plant_engineer_human"
+        condition: "calling_agent_response.out_of_control_lines != []"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  qa_inspector_human:
+    name: "qa_inspector_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "QA inspector — first-line verification"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 7200
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_qa_manager"
+      message: "escalate_to_qa_manager"
+      note: "Inspector didn't respond — escalating to QA manager"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      batch_id: "string"
+    can_call:
+      - agent: "qa_manager_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_qa_manager'"
+      - agent: "qa_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_qa_manager'"
+
+  qa_manager_human:
+    name: "qa_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "QA manager — batch-release authority"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "QA manager unavailable — batch held (default-deny)"
+    yields:
+      decision: "string"                # release | quarantine | rework | halt
+      notes: "string"
+    inputs:
+      batch_id: "string"
+    can_call:
+      - agent: "plant_engineer_human"
+        condition: "calling_agent_response.human_message == 'rework'"
+      - agent: "qa_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'rework'"
+
+  plant_engineer_human:
+    name: "plant_engineer_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Plant engineer — process-side root-cause + corrective"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 21600
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Plant engineer unavailable — held"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      batch_id: "string"
+    can_call:
+      - agent: "qa_audit_logger_agent"
+
+  qa_audit_logger_agent:
+    name: "qa_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM — every batch decision + CAPA"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/qa_audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # recall_traceability_agent — trace + recall coordination (LLM + module)
+  # The LLM traces complaints to batch/line/shift, scopes the recall and
+  # sets the severity class + escalation flags; agency/recall_traceability
+  # _agent.py adds the deterministic depth:
+  #   @pre_compose  pull the batch genealogy, the related batches that
+  #                 shared a tainted lot (freeze scope) and prior recalls.
+  #   @chain        the REGULATOR-ROUTING + statutory FILING-WINDOW floor
+  #                 (which regulator, what deadline) + the fail-closed
+  #                 related-batch FREEZE actuator (idempotent). No
+  #                 defect_id ⇒ trace-only, no filing obligation. Holds
+  #                 on direct calls.
+  # ────────────────────────────────────────────────────────────
+  recall_traceability_agent:
+    name: "recall_traceability_agent"
+    agent_type: "llm"
+    description: "Traces complaints/audits to batch/line/shift AND coordinates recalls: customer notify + regulator filings + related-batch freeze + exec escalation"
+    model: "claude-sonnet-4-6"
+    temperature: 0.0
+    max_completion_tokens: 2000
+    communication_type: "chain"
+
+    prompt: |
+      You are the recall & traceability officer. Work the case in two
+      responsibilities, in order.
+
+      Responsibility 1 — TRACE. A customer complaint, auditor request
+      or internal review names a defective unit. Trace it back through
+      the SPC log / shipment manifest / batch register:
+        - batch_id: identified batch
+        - line_id: production line
+        - shift_id: shift the batch ran
+        - production_date: ISO date
+        - shipment_id: outbound shipment ID
+        - related_units_in_field: estimated count of similar units
+          shipped (recall scope)
+        - recall_recommendation: none | informational | voluntary | full
+        - customer_facing_response: short message to the complainant
+          acknowledging + next step (replacement / refund / inspection)
+        - root_cause_hypothesis: short hypothesis (will inform CAPA)
+        - confidence: 0..1
+
+      Customer trust is in the balance. Honesty + speed beat perfection.
+
+      Responsibility 2 — RECALL COORDINATION. When a safety-critical
+      defect (defect_id present) lands, coordinate the recall response
+      using your own trace:
+        - product_class: medical_device | pharma | food_bev |
+            automotive | consumer | electronics | industrial
+        - affected_batches: list of batch_ids
+        - units_in_market: integer
+        - customer_count: integer
+        - severity: voluntary | recall_class3 | recall_class2 | recall_class1
+        - related_batches_frozen: list of other batches sharing the
+          root cause (to freeze)
+
+      Be conservative. When in doubt, classify ONE severity higher.
+      When no recall is being coordinated, return the recall keys
+      empty / zero.
+
+      Hard rules (deterministic policy — never relax):
+        - "recall_recommendation" MUST be one of: none | informational |
+          voluntary | full
+        - "related_units_in_field" >= 1000 → "recall_recommendation"
+          MUST be at LEAST informational
+        - "related_units_in_field" >= 10000 → "recall_recommendation"
+          MUST be at LEAST voluntary
+        - "severity" MUST be one of: voluntary | recall_class3 |
+          recall_class2 | recall_class1
+        - "requires_executive_escalation" MUST be true for
+          recall_class1 or recall_class2
+        - "requires_customer_notification" MUST be true when
+          "customer_count" > 0
+        - "recall_id": recall-<defect_id>-<epoch seconds> when a
+          recall is being coordinated, otherwise ""
+        - regulator routing is NOT your call: "regulators_to_notify",
+          "filing_deadlines", "requires_regulatory_filing" and
+          "opened_at_utc" are stamped deterministically by the agency
+          module from "product_class" — return empty/zero placeholders
+          for those keys.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"batch_id": "", "line_id": "", "shift_id": "", "production_date": "", "shipment_id": "", "related_units_in_field": 0, "recall_recommendation": "", "customer_facing_response": "", "root_cause_hypothesis": "", "confidence": 0, "recall_id": "", "defect_id": "", "product_class": "", "severity": "", "affected_batches": [], "units_in_market": 0, "customer_count": 0, "regulators_to_notify": [], "filing_deadlines": {}, "related_batches_frozen": [], "requires_executive_escalation": false, "requires_customer_notification": false, "requires_regulatory_filing": false, "opened_at_utc": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    # knowledge: batch_register kept from the absorbed traceability
+    # agent — tracing is the data-dependent judgment stage; regulator
+    # routing / filing deadlines are deterministic in the module.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "batch_register"
+
+    yields:
+      batch_id: "string"
+      line_id: "string"
+      shift_id: "string"
+      production_date: "string"
+      shipment_id: "string"
+      related_units_in_field: "number"
+      recall_recommendation: "string"
+      customer_facing_response: "string"
+      root_cause_hypothesis: "string"
+      confidence: "number"
+      recall_id: "string"
+      defect_id: "string"
+      product_class: "string"
+      severity: "string"
+      affected_batches: "list"
+      units_in_market: "number"
+      customer_count: "number"
+      regulators_to_notify: "list"
+      filing_deadlines: "object"
+      related_batches_frozen: "list"
+      requires_executive_escalation: "boolean"
+      requires_customer_notification: "boolean"
+      requires_regulatory_filing: "boolean"
+      opened_at_utc: "string"
+
+    inputs:
+      complaint: "object"
+      source_event_id: "string"          # resolves the seeded complaint/defect
+      batch_id: "string"
+      upstream_yields: "object"
+      defect_id: "string"
+
+    # Single unconditional edge — the trace edge was unconditional and
+    # subsumes the two conditional recall edges (exec escalation /
+    # regulatory filing) that pointed at the same reviewer.
+    can_call:
+      - agent: "qa_manager_human"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # corrective_action_tracker_agent — CAPA register (connector-YAML)
+  # ────────────────────────────────────────────────────────────
+  corrective_action_tracker_agent:
+    name: "corrective_action_tracker_agent"
+    agent_type: "programmatic"
+    description: "Opens / updates / reports CAPAs with effectiveness verification"
+    communication_type: "chain"
+
+    # ── YOUR SYSTEM OF RECORD ────────────────────────────────────
+    # CAPAs live in your QMS, not in this template. Point this
+    # connector at an MCP gateway (or swap integration to n8n/zapier)
+    # that returns the yields below.
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${QMS_MCP_URL:}"                  # your QMS gateway
+      tool_name: "track_corrective_actions"   # must return the yields below
+      timeout: 30
+
+    yields:
+      mode: "string"
+      capa_id: "string"
+      status: "string"
+      due_at_utc: "string"
+      total_capas: "number"
+      by_status: "object"
+      overdue_count: "number"
+      overdue_capas: "list"
+      effectiveness: "object"
+      requires_qa_director_action: "boolean"
+      capa_briefing: "string"
+    inputs:
+      mode: "string"
+      capa_id: "string"
+      source_event: "string"
+      root_cause: "string"
+      action_summary: "string"
+      owner: "string"
+      status: "string"
+      effective: "boolean"
+      due_days: "number"
+    can_call: []
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # regulatory_compliance_agent — audit-readiness + reportability
+  # (LLM + module). The LLM builds the per-framework audit-readiness
+  # scorecard (evidence inventory vs requirements → CAPA recs);
+  # agency/regulatory_compliance_agent.py adds the deterministic depth:
+  #   @pre_compose  pull the batch genealogy (product_class = the
+  #                 regulator routing key) + prior recalls from the
+  #                 source store.
+  #   @chain        the REGULATOR-ROUTING + statutory FILING-WINDOW
+  #                 floor — a reportable defect / recall class FORCES the
+  #                 correct regulator list + statutory windows + manager
+  #                 review (the LLM cannot mark a reportable batch
+  #                 audit-ready with no filing obligation). Fail-closed:
+  #                 a routine scorecard (no reportable class) is
+  #                 untouched. Holds on direct calls. Shares the
+  #                 regulator tables with recall_traceability_agent.
+  # Scorecards belong in your QMS, not SQLite.
+  # ────────────────────────────────────────────────────────────
+  regulatory_compliance_agent:
+    name: "regulatory_compliance_agent"
+    agent_type: "llm"
+    description: "Per-framework audit-readiness — evidence inventory vs requirements → CAPA recommendations; a code floor forces the regulator routing + statutory filing window on any reportable defect/recall class"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 2000
+    communication_type: "chain"
+
+    prompt: |
+      You are the regulatory-compliance officer. Build the
+      audit-readiness scorecard for the requested framework.
+
+      Required evidence depends on framework:
+        - fda_21cfr11: audit_logs, e_signatures, data_integrity,
+          change_control, training_records
+        - iso_13485: capa_log, design_history, supplier_audits,
+          complaints_log, internal_audits
+        - eu_mdr: udi_records, technical_documentation,
+          vigilance_reports, clinical_evaluation
+        - fda_gmp: batch_records, raw_material_coa, in_process_checks,
+          release_testing, stability_data
+        - iso_22000: haccp_plan, supplier_approval, traceability,
+          allergen_control, thermometer_calibration
+
+      Partition the framework's required evidence (use the
+      qms_evidence_index knowledge group) into:
+        - "evidence_present": current (updated within 90 days)
+        - "evidence_stale": present but last_updated > 90 days ago
+        - "evidence_missing": required but not found
+
+      Hard rules (deterministic scoring — never relax):
+        - "framework" MUST be one of the five above. Anything else:
+          fail closed — "readiness_score" 0, "audit_ready" false,
+          "requires_quality_manager_review" true.
+        - "readiness_score" = count(present) / count(required for the
+          framework), rounded to 2 decimals
+        - "audit_ready" = true only when "readiness_score" >= 0.90
+          AND nothing is missing
+        - "requires_capa" = true if ANY evidence is missing or stale
+        - "requires_quality_manager_review" = true when
+          "readiness_score" < 0.80 OR 3+ evidence types are missing
+        - "scorecard_id": audit-<framework>-<epoch seconds>
+        - "assessed_at_utc": current UTC ISO timestamp
+
+      Regulator routing is NOT your call: "reportable",
+      "product_class", "regulators_to_notify", "filing_deadlines" and
+      "requires_regulatory_filing" are stamped deterministically by the
+      agency module's @chain from the batch product class whenever a
+      reportable defect / recall class is in play (a safety-critical
+      defect or a recall_class1/2/3 severity). Return empty / false
+      placeholders for those keys — the module forces the correct
+      regulator list + statutory filing windows and you cannot omit a
+      regulator or mark a reportable batch audit-ready.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"scorecard_id": "", "framework": "", "evidence_present": [], "evidence_missing": [], "evidence_stale": [], "readiness_score": 0, "audit_ready": false, "requires_capa": false, "requires_quality_manager_review": false, "assessed_at_utc": "", "reportable": false, "product_class": "", "regulators_to_notify": [], "filing_deadlines": {}, "requires_regulatory_filing": false}
+
+    enforce_yields: true
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "qms_evidence_index"
+
+    yields:
+      scorecard_id: "string"
+      framework: "string"
+      evidence_present: "list"
+      evidence_missing: "list"
+      evidence_stale: "list"
+      readiness_score: "number"
+      audit_ready: "boolean"
+      requires_capa: "boolean"
+      requires_quality_manager_review: "boolean"
+      assessed_at_utc: "string"
+      # ── stamped by the @chain regulator-routing + filing-window floor ──
+      reportable: "boolean"
+      product_class: "string"
+      regulators_to_notify: "list"
+      filing_deadlines: "object"
+      requires_regulatory_filing: "boolean"
+
+    inputs:
+      framework: "string"
+      next_audit_window: "string"
+      batch_id: "string"               # resolves product_class for routing
+      defect_class: "string"           # reportability signal
+      severity: "string"               # recall severity (reportability signal)
+      upstream_yields: "object"
+
+    can_call:
+      - agent: "quality_engineer_agent"
+        condition: "calling_agent_response.requires_capa == true"
+
+      - agent: "qa_manager_human"
+        condition: "calling_agent_response.requires_quality_manager_review == true"
+
+      # A reportable defect/recall class opens a statutory filing
+      # obligation — the recall & traceability officer coordinates the
+      # filing. The @chain sets requires_regulatory_filing; this edge is
+      # the floor, not a prompt suggestion.
+      - agent: "recall_traceability_agent"
+        condition: "calling_agent_response.requires_regulatory_filing == true"
+
+    auto_store_response: true
+    auto_store_yields: true

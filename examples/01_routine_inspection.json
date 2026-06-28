@@ -1,0 +1,11 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "QA pulls a sample batch \u2014 inspection_intake records + classifies no defects, batch released.",
+  "payload": {
+    "batch_id": "batch-2026-W23-0091",
+    "line_id": "line-portland-04",
+    "source": "qa_sample",
+    "sample_size": 30,
+    "lot_size": 480
+  }
+}
