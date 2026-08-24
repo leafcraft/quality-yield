@@ -124,10 +124,13 @@ def _to_quality_engineer(result: dict, ctx: Any) -> dict[str, Any]:
     }
 
 
-def _to_qa_manager(result: dict, ctx: Any) -> dict[str, Any]:
-    """The batch-release authority decides on the disposition + briefing."""
+def _to_batch_release(result: dict, ctx: Any) -> dict[str, Any]:
+    """The finisher routes the disposition to the release authority — it needs
+    the batch identity + the safety flag it re-derives, and the disposition
+    context for the certificate."""
     return {
         "batch_id": result.get("batch_id", ""),
+        "line_id": result.get("line_id", ""),
         "defect_class": result.get("defect_class", ""),
         "severity": result.get("severity", 0),
         "quarantine_recommended": result.get("quarantine_recommended", False),
@@ -149,7 +152,7 @@ def _to_qa_inspector(result: dict, ctx: Any) -> dict[str, Any]:
 @pre_compose(context_processor=load_inspection_context)
 @compose(
     quality_engineer_agent=_to_quality_engineer,
-    qa_manager_human=_to_qa_manager,
+    batch_release_agent=_to_batch_release,
     qa_inspector_human=_to_qa_inspector,
 )
 @chain(enforce_disposition_floor)

@@ -1,5 +1,5 @@
 {
-  "_entry_point": "manual_action",
+  "_entry_point": "report_signal",
   "_description": "Inspection finds 4 defective units in one sample \u2014 inspection_intake classifies the cluster, quality_engineer runs 5-whys and drafts the CAPA.",
   "payload": {
     "batch_id": "batch-2026-W23-0094",

@@ -29,7 +29,7 @@ EXAMPLES_DIR = Path(__file__).parent
 async def run_scenario(sdk: LeafMesh, scenario_path: Path) -> None:
     scenario = scenario_path.stem
     payload = json.loads(scenario_path.read_text())
-    entry_point = payload.pop("_entry_point", "manual_action")
+    entry_point = payload.pop("_entry_point", "report_signal")
     description = payload.pop("_description", "")
     print()
     print("=" * 78)

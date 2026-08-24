@@ -1,10 +1,18 @@
-"""quality-yield — Quality & Yield (YAML-first).
+"""quality-yield — Quality & Yield Pod (LeafMesh).
 
-All mesh behaviour is declared in configs/config.yaml. Python lives
-only where it must: the recall regulator tables + SPC Western
-Electric math (agency/) and the WORM audit sink registered below.
-CAPAs are tracked in YOUR QMS via the corrective_action_tracker
-mcp connector.
+Boot order matters (SDK 2.4.131):
+  1. import agency.tools  -> the @global_tool decorators run BEFORE from_yaml/
+     start, so intake's read_batch_genealogy / read_defect_record /
+     read_prior_recalls and the sweeper's claim_inspection are registered.
+  2. LeafMesh.from_yaml(...) -> auto_discover wires agency/*_agent.py to the YAML.
+  3. audit_logger.register(...) -> attach the WORM sink to the custom external
+     qa_audit_logger_agent (must be after from_yaml, before start).
+  4. leafmesh.start().
+
+Python lives only where it must: the deterministic floors (defect scoring, SPC
+math, regulator tables, fail-closed release actuator) and the WORM audit sink.
+The seeded dev store (agency/_shared/store.py) stands in for the MES/LIMS/QMS/
+historian so the whole chain runs day-0 with no connectors.
 """
 import asyncio
 import signal
@@ -13,6 +21,7 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
+import agency.tools  # noqa: F401 — registers @global_tool tools before start()
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()

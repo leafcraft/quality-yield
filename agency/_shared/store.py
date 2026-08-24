@@ -207,6 +207,13 @@ _SEED_RECALLS: list[dict[str, Any]] = [
      "opened_at_utc": "2026-03-01T00:00:00+00:00"},
 ]
 
+# Pending-inspection backlog — the queue the scheduled Batch-Inspection Sweeper
+# fans out over (instances). Each id is a pending inspection event; the atomic
+# claim pops a disjoint slice per copy. PROD: the LIMS/vision inspection queue.
+_SEED_PENDING_INSPECTIONS: list[str] = [
+    "evt-vision-4471", "evt-complaint-2210", "evt-vision-3300", "evt-spc-l7",
+]
+
 
 # ── Batch register (genealogy) ───────────────────────────────────────
 def _batches() -> dict[str, Any]:
@@ -372,3 +379,154 @@ def record_recall(row: dict[str, Any]) -> None:
             "opened_at_utc": str(row.get("opened_at_utc") or _now()),
         })
         _save("recalls", s)
+
+
+# ── Pending-inspection backlog (the Sweeper's instances fan-out source) ──────
+def _pending() -> list[str]:
+    s = _load("pending_inspections")
+    if not s:
+        s = {"queue": list(_SEED_PENDING_INSPECTIONS)}
+        _save("pending_inspections", s)
+    return list(s.get("queue", []))
+
+
+def claim_pending_inspections(count: int = 1) -> list[str]:
+    """Atomically claim up to `count` pending inspection event ids, popping them
+    from the shared backlog so parallel sweeper copies never claim the same
+    event. Returns [] when the backlog is empty. PROD: LIMS queue LPOP / UPDATE
+    ... SKIP LOCKED RETURNING."""
+    try:
+        n = max(1, int(count))
+    except (TypeError, ValueError):
+        n = 1
+    with _LOCK:
+        s = _load("pending_inspections")
+        if not s:
+            s = {"queue": list(_SEED_PENDING_INSPECTIONS)}
+        queue = list(s.get("queue", []))
+        claimed = queue[:n]
+        s["queue"] = queue[n:]
+        _save("pending_inspections", s)
+    return claimed
+
+
+def pending_inspection_count() -> int:
+    """Remaining size of the pending-inspection backlog."""
+    return len(_pending())
+
+
+# ── Disposition round counter (bounds the rework back-edge) ──────────────────
+def bump_disposition_round(batch_id: str) -> int:
+    """Increment and return the disposition-routing round for a batch. The
+    finisher uses this to terminate a rework loop that won't converge."""
+    if not batch_id:
+        return 0
+    with _LOCK:
+        s = _load("disposition_rounds")
+        n = int(s.get(batch_id, 0)) + 1
+        s[batch_id] = n
+        _save("disposition_rounds", s)
+    return n
+
+
+def get_disposition_round(batch_id: str) -> int:
+    if not batch_id:
+        return 0
+    return int(_load("disposition_rounds").get(batch_id, 0))
+
+
+# ── Release outbox + append-only ledger (the finisher's records) ─────────────
+def record_release_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    """Record a batch-release action (the MES release call, in dev). PROD: the
+    MES/ERP release API already holds it."""
+    with _LOCK:
+        outbox = _load("release_outbox")
+        rows = list(outbox.get("rows", []))
+        rec = {"recorded_at": _now(), **entry}
+        rows.append(rec)
+        _save("release_outbox", {"rows": rows})
+    return rec
+
+
+def append_release_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only disposition ledger (dev mirror of the WORM sink) keyed by
+    batch, so the finisher can recover a released batch after the HITL gap."""
+    with _LOCK:
+        ledger = _load("release_ledger")
+        rows = list(ledger.get("rows", []))
+        rec = {"recorded_at": _now(), **entry}
+        rows.append(rec)
+        by_batch = dict(ledger.get("by_batch", {}))
+        if rec.get("batch_id"):
+            by_batch[str(rec["batch_id"])] = rec
+        _save("release_ledger", {"rows": rows, "by_batch": by_batch})
+    return rec
+
+
+def get_batch_disposition(batch_id: str) -> dict[str, Any]:
+    """Recover a batch's disposition record after the HITL gap. PROD: MES read."""
+    if not batch_id:
+        return {}
+    return _load("release_ledger").get("by_batch", {}).get(str(batch_id), {})
+
+
+# ── CAPA register CRUD + report (the tracker's dev-store surface) ─────────────
+def all_capas() -> list[dict[str, Any]]:
+    return list(_capas().values())
+
+
+def open_capa(record: dict[str, Any]) -> dict[str, Any]:
+    """Open a CAPA in the register. PROD: QMS create. Returns the stored row."""
+    with _LOCK:
+        s = _capas()
+        capa_id = str(record.get("capa_id") or f"CAPA-{int(datetime.now(timezone.utc).timestamp())}")
+        row = {
+            "capa_id": capa_id,
+            "line_id": str(record.get("line_id") or ""),
+            "primary_cause": str(record.get("primary_cause") or ""),
+            "summary": str(record.get("summary") or record.get("action_summary") or ""),
+            "status": str(record.get("status") or "open"),
+            "owner": str(record.get("owner") or "quality_engineer"),
+            "opened_at_utc": _now(),
+            "due_at_utc": str(record.get("due_at_utc") or ""),
+            "effective": record.get("effective"),
+        }
+        s[capa_id] = row
+        _save("capas", s)
+    return row
+
+
+def update_capa(capa_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Update a CAPA's status / effectiveness. PROD: QMS update. {} if unknown."""
+    if not capa_id:
+        return {}
+    with _LOCK:
+        s = _capas()
+        row = s.get(capa_id)
+        if not row:
+            return {}
+        for k in ("status", "effective", "due_at_utc", "summary", "owner"):
+            if k in fields and fields[k] is not None:
+                row[k] = fields[k]
+        row["updated_at_utc"] = _now()
+        s[capa_id] = row
+        _save("capas", s)
+    return row
+
+
+def capa_report() -> dict[str, Any]:
+    """Register-wide CAPA state — totals, by-status, overdue. PROD: QMS query."""
+    rows = all_capas()
+    by_status: dict[str, int] = {}
+    for r in rows:
+        st = str(r.get("status") or "unknown")
+        by_status[st] = by_status.get(st, 0) + 1
+    now = datetime.now(timezone.utc).isoformat()
+    overdue = [r for r in rows
+               if str(r.get("status")) == "open" and str(r.get("due_at_utc") or "") and str(r["due_at_utc"]) < now]
+    return {
+        "total_capas": len(rows),
+        "by_status": by_status,
+        "overdue_count": len(overdue),
+        "overdue_capas": [r.get("capa_id") for r in overdue],
+    }
