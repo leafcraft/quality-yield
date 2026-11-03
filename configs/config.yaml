@@ -7,7 +7,8 @@
 # certificate (fail-closed) -> every decision lands in a WORM audit sink.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
-# is a finished contract; every human gate default-denies on silence; the
+# is a finished contract; nothing is released on silence; a safety-critical
+# batch ships only on two signatures (QA Manager + Quality Director); the
 # finisher produces the real artifact and fails closed; the WORM sink is the
 # terminus. Systems (MES / LIMS / QMS / plant historian) are TOOLS inside
 # agents, never members — and data never leaves them.
@@ -22,20 +23,18 @@ environment: development
 debug: true
 log_level: INFO
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    password: "${REDIS_PASSWORD:}"
-
 auto_discover:
   directory: ./agency
   pattern: '*_agent.py'
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the Quality Director. It is
-# not a router in the middle of the team.
+# The Manager is the SUPERVISOR, not a router in the middle of the team
+# (static routing). It escalates to the Quality Director on a non-retryable
+# error (auth / bad request / credit / bad config), when 5 different agents
+# fail in one case (max_errors_per_session), or when restarts run out. A
+# malformed hand-off only alerts. A question nobody answers is NOT escalated:
+# the card closes and the ticket records that no reply came. The rework-loop
+# bound, executive recalls and the second release signature reach the
+# Quality Director through can_call wires.
 manager:
   model: gpt-4o-mini
   domain: generic
@@ -45,10 +44,10 @@ manager:
     engineer (root cause + drafted CAPA) -> the QA Manager decides release /
     quarantine / rework -> the batch-release finisher issues the certificate
     ONLY on an explicit release, and every decision is hash-chained in the
-    audit sink. Escalate to the Quality Director when: a batch loops on
-    re-work past its bound, a safety-critical defect or possible recall is
-    raised, a release decision times out, or any agent hands off a malformed
-    artifact. Silence never releases a batch.
+    audit sink. The team's own wires send an exhausted rework loop, a Class
+    I/II recall and the second signature on a safety-critical release to the
+    Quality Director. You escalate to the Quality Director when agents keep
+    failing. Silence never releases a batch.
   routing:
     mode: static
   escalation:
@@ -58,16 +57,13 @@ manager:
     auto_escalate:
       max_retries: 3
       max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — root-cause reasoning + recall tracing can run long.
 # Everything else stays default (omission is meaningful; we do not pre-fill
 # defaults). NOTE: the `timeouts` block is REJECTED by <=2.4.130 — it must land
 # with the 2.4.131 floor, never before.
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 # ── Entry points — one per real-world trigger ────────────────────────────────
@@ -135,7 +131,7 @@ entry_points:
     description: "Cron — periodic SPC sweep across every line."
     condition: always
 
-  # Scheduled batch-inspection backlog sweep (instances fan-out).
+  # Scheduled batch-inspection backlog sweep (scaling.copies fan-out).
   - name: scheduled_batch_inspection
     target: batch_inspection_sweeper_agent
     description: "Cron — fan out across the pending-inspection backlog, claim disjoint work, feed intake."
@@ -295,14 +291,14 @@ agents:
     # source. See agency/tools.py.
     tools: [read_batch_genealogy, read_defect_record, read_prior_recalls]
     tool_categories: [inspection]
-    # ── To wire a real LIMS / vision system, uncomment and set the URL (each
-    #    named action under `use:` becomes its own tool). NOTE: the SDK rejects an
-    #    http mcp block with an EMPTY url at load, so this ships commented — fill
-    #    the URL, then uncomment. ──
+    # ── To wire a real LIMS / vision system: create the vault connection
+    #    'lims_mcp' on Infrastructure → Integrations → MCP (the MCP server's
+    #    URL + token live there, never here), then uncomment — here before the
+    #    first start, in Studio's YAML editor after it (applies live, no restart).
+    #    Each named action under `use:` becomes its own tool. ──
     # mcp:
-    #   - transport: http
-    #     url: "${LIMS_MCP_URL}"
-    #     token: "${LIMS_MCP_TOKEN:}"
+    #   - connection: lims_mcp   # vault connection holds the URL + token
+    #     transport: http
     #     use: [read_defect, read_batch, read_inspection_history]
     #     name: lims
     #     timeout: 30
@@ -339,7 +335,7 @@ agents:
     temperature: 0.1
     max_completion_tokens: 2000
     thinking: true
-    thinking_budget: 4096
+    reasoning_budget: 4096
     description: "Quality Engineer — correlates the defect to root cause (process / supplier / batch), drafts the CAPA."
     prompt: |
       You are the Quality Engineer for this line. Correlate the defect to its
@@ -364,7 +360,11 @@ agents:
     enforce_yields: true
     enforce_yields_retry: 2
     yields:
-      root_causes: "list"               # [{cause, evidence, confidence}]
+      root_causes:                      # the @chain keeps only process / supplier / batch / environmental
+        type: array
+        items:
+          type: object
+          fields: {cause: string, evidence: string, confidence: number}
       primary_cause: "string"
       multi_source: "boolean"
       requires_engineer_review: "boolean"
@@ -408,13 +408,13 @@ agents:
         condition: "calling_agent_response.capa_required == true"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Batch-Inspection Sweeper (AI, INSTANCES fan-out). The scheduled backlog
+  # Batch-Inspection Sweeper (AI, scaling.copies fan-out). The scheduled backlog
   # worker: on each activation it runs as N parallel copies, and each copy calls
   # the atomic `claim_inspection` tool to pull a DISJOINT slice of the pending-
   # inspection backlog, so the copies never duplicate work. The claimed events
   # are handed to intake. Merge is deterministic (lists concat, counts sum —
   # this agent yields only lists + counts, never ratios). One cron line; N
-  # copies come from `instances`, not from multiplying the trigger.
+  # copies come from `scaling.copies.count`, not from multiplying the trigger.
   # ─────────────────────────────────────────────────────────────────────────
   batch_inspection_sweeper_agent:
     name: batch_inspection_sweeper_agent
@@ -423,8 +423,11 @@ agents:
     model: gpt-4o-mini
     temperature: 0.0
     max_tool_calls_per_message: 10
-    instances: 3                       # 3 parallel copies per activation
-    instances_handoff: last            # combine and route once
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                       # 3 parallel copies per activation
+        handoff: last            # combine and route once
     description: "Batch-Inspection Sweeper — fans out across the pending-inspection backlog, claims disjoint work."
     wake_up: "0 7 * * *"
     timezone: "Asia/Kolkata"           # plant timezone — a bare cron fires in UTC
@@ -554,12 +557,12 @@ agents:
       defect_id: "string"
       product_class: "string"
       severity: "string"
-      affected_batches: "list"
+      affected_batches: {type: array, items: string}
       units_in_market: "number"
       customer_count: "number"
-      regulators_to_notify: "list"
+      regulators_to_notify: {type: array, items: string}
       filing_deadlines: "object"
-      related_batches_frozen: "list"
+      related_batches_frozen: {type: array, items: string}
       requires_executive_escalation: "boolean"
       requires_customer_notification: "boolean"
       requires_regulatory_filing: "boolean"
@@ -585,8 +588,12 @@ agents:
       upstream_yields: "object"
       defect_id: "string"
     can_call:
+      # A Class I / II recall is an executive decision — the Quality Director.
+      - agent: quality_director_human
+        condition: "calling_agent_response.requires_executive_escalation == true"
+      # Any other recall recommendation — the QA Manager.
       - agent: qa_manager_human
-        condition: "calling_agent_response.recall_recommendation != 'none' or calling_agent_response.requires_executive_escalation == true"
+        condition: "calling_agent_response.recall_recommendation != 'none' and calling_agent_response.requires_executive_escalation == false"
       - agent: qa_audit_logger_agent
         condition: "calling_agent_response.recall_recommendation == 'none'"
 
@@ -636,9 +643,9 @@ agents:
     yields:
       scorecard_id: "string"
       framework: "string"
-      evidence_present: "list"
-      evidence_missing: "list"
-      evidence_stale: "list"
+      evidence_present: {type: array, items: string}
+      evidence_missing: {type: array, items: string}
+      evidence_stale: {type: array, items: string}
       readiness_score: "number"
       audit_ready: "boolean"
       requires_capa: "boolean"
@@ -647,7 +654,7 @@ agents:
       # ── stamped by the @chain regulator-routing + filing-window floor ──
       reportable: "boolean"
       product_class: "string"
-      regulators_to_notify: "list"
+      regulators_to_notify: {type: array, items: string}
       filing_deadlines: "object"
       requires_regulatory_filing: "boolean"
     inputs:
@@ -679,14 +686,18 @@ agents:
     agent_type: programmatic
     description: "CAPA Register Coordinator — opens / updates / reports CAPAs with effectiveness verification."
     # ── YOUR SYSTEM OF RECORD ────────────────────────────────────────────────
-    # CAPAs belong in your QMS. To wire it, uncomment and set QMS_MCP_URL (the
-    # connector calls `track_corrective_actions`). NOTE: an mcp connector with an
-    # EMPTY url is rejected at load, so this ships commented — the dev-store
-    # register (store.py) runs the day-0 demo. ──
+    # CAPAs belong in your QMS. To wire it: create the vault connection
+    # 'qms_mcp' on Infrastructure → Integrations → MCP (or an "Add custom" record,
+    # service type Tools, whose base URL is the QMS MCP server's address; its
+    # token lives there too, never here), then uncomment — here before the first
+    # start, in Studio's YAML editor after it (the connector calls
+    # `track_corrective_actions`; its response is handed to this agent's
+    # Python body as its first argument — adapt the body to read it). Until
+    # then the dev-store register (store.py) runs the day-0 demo. ──
     # integration: mcp
     # connector_config:
+    #   connection: qms_mcp   # vault connection holds the URL + token
     #   transport: http
-    #   url: "${QMS_MCP_URL}"
     #   tool_name: track_corrective_actions
     #   timeout: 30
     yields:
@@ -723,7 +734,8 @@ agents:
   # QA-manager gate. It never releases on its own authority: it re-checks that a
   # human actually released (an allow-token allowlist + block-token denylist; an
   # UNKNOWN verdict fails closed), re-derives the safety invariant in code
-  # (a safety-critical batch never ships on this path), renders the release
+  # (a safety-critical batch ships only on two signatures — the QA Manager's,
+  # then the Quality Director's, two different people), renders the release
   # certificate to ./out, DELETES it on a tripped floor, and records an
   # append-only ledger entry. See agency/batch_release_agent.py.
   #
@@ -742,47 +754,55 @@ agents:
       released: "boolean"
       disposition: "string"
       certificate_path: "string"
-      status: "string"          # routed | released | blocked | exhausted
+      status: "string"          # routed | awaiting_second_signature | released | blocked | exhausted
       block_reasons: "list"
+      second_signer: "string"   # the seat whose release signature is still missing
       batch_id: "string"
     inputs:
       batch_id: "string"
       upstream_yields: "object"
     can_call:
       - agent: qa_manager_human
-        condition: "calling_agent_response.status == 'routed'"
+        condition: "calling_agent_response.status == 'routed' or (calling_agent_response.status == 'awaiting_second_signature' and calling_agent_response.second_signer == 'qa_manager_human')"
       # Bounded back-edge terminal — a batch that looped on rework past its bound
-      # escalates to the accountable owner instead of re-routing forever.
+      # escalates to the accountable owner instead of re-routing forever. The
+      # Director is also the second signature on a safety-critical release.
       - agent: quality_director_human
-        condition: "calling_agent_response.status == 'exhausted'"
+        condition: "calling_agent_response.status == 'exhausted' or (calling_agent_response.status == 'awaiting_second_signature' and calling_agent_response.second_signer == 'quality_director_human')"
       - agent: qa_audit_logger_agent
         condition: "always"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
-  # `dual` belongs on the human boundary agent ONLY; a human never calls another
-  # human (that would be dual->dual ping-pong) — human->human escalation is the
-  # Manager SUPERVISOR's job (manager.escalation.targets).
+  # Human members — first-class, answering in Studio's Inbox. Timeouts follow
+  # a plant QA day: the inspector checks within 2h, the QA Manager decides a
+  # disposition within 4h, the plant engineer issues a directive within a
+  # shift (6h), the Quality Director answers a recall / second signature
+  # within 4h — a recall decision is same-day work.
+  # If nobody answers in time, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nothing is released on
+  # silence, and nobody is chased automatically. fallback_on_timeout /
+  # fallback_response state the intended default-deny (held_for_review ->
+  # audit); leafmesh 2.4.486 does not route it for these dual seats yet.
+  # Every value a seat asks for has a route. `dual` belongs on the human
+  # boundary agent ONLY; a human never calls another human (dual->dual
+  # ping-pong) — the finisher carries a batch from one signer to the next.
   # ─────────────────────────────────────────────────────────────────────────
 
   qa_manager_human:
     name: qa_manager_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
+    # A safety-critical release needs two identified, different signers. Name
+    # the people who hold this seat (their Studio logins) so the Inbox records
+    # who signed; without it a safety-critical batch is never released.
+    # operator_ids: ["qa.manager@yourcompany.example"]
     communication_type: dual
     human_timeout_seconds: 14400    # 4 hours to decide a batch disposition
-    description: "QA Manager — the batch-release authority; releases / quarantines / reworks / halts a batch."
+    description: "QA Manager — the batch-release authority; releases / quarantines / reworks / halts a batch. On a safety-critical batch the release is the first of two signatures."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     yields:
       human_message: "string"       # release | quarantine | rework | halt | held_for_review
     inputs:
@@ -800,7 +820,7 @@ agents:
   qa_inspector_human:
     name: qa_inspector_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 7200     # 2 hours for a first-line check
     description: "QA Inspector — first-line verification of a real but low-severity defect; escalate or clear."
@@ -808,10 +828,6 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
       human_message: "string"       # escalate | pass | clear | held_for_review
     inputs:
@@ -827,7 +843,7 @@ agents:
   plant_engineer_human:
     name: plant_engineer_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: dual
     human_timeout_seconds: 21600    # 6 hours for a process-side directive
     description: "Plant Engineer — process-side root-cause + corrective directive on the floor."
@@ -835,10 +851,6 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
       human_message: "string"       # directive_issued | held_for_review
     inputs:
@@ -850,25 +862,29 @@ agents:
   quality_director_human:
     name: quality_director_human
     agent_type: human
-    human_interface: webhook
+    human_interface: "default"   # the Inbox (no vault connection needed)
+    # A safety-critical release needs two identified, different signers. Name
+    # the people who hold this seat (their Studio logins) so the Inbox records
+    # who signed; without it a safety-critical batch is never released.
+    # operator_ids: ["quality.director@yourcompany.example"]
     communication_type: dual
-    human_timeout_seconds: 259200   # 3 days — the accountable owner
-    description: "Quality Director — accountable owner; reviews escalations, owns the call on everything that leaves the pod."
+    human_timeout_seconds: 14400    # 4 hours — recall decisions and second signatures are same-day work
+    description: "Quality Director — accountable owner; second signature on a safety-critical release, Class I/II recall decisions, exhausted rework loops."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
-      human_message: "string"
+      human_message: "string"       # release | quarantine | acknowledged | held_for_review
     inputs:
       exception: "object"
     can_call:
+      # The second signature on a safety-critical batch (or a release after an
+      # exhausted rework loop) — the finisher re-checks both signatures.
+      - agent: batch_release_agent
+        condition: "calling_agent_response.human_message == 'release'"
       - agent: qa_audit_logger_agent
-        condition: "always"
+        condition: "calling_agent_response.human_message == 'quarantine' or calling_agent_response.human_message == 'acknowledged' or calling_agent_response.human_message == 'held_for_review'"
 
   # ─────────────────────────────────────────────────────────────────────────
   # WORM audit sink — hash-chained, append-only, the terminus of every path.
@@ -878,7 +894,7 @@ agents:
     name: qa_audit_logger_agent
     agent_type: external
     framework: custom
-    communication_type: execute
+    communication_type: chain
     description: "Quality Records Registrar — hash-chains every batch decision, CAPA, and recall. Terminus."
     connector_config:
       sink_type: local_file

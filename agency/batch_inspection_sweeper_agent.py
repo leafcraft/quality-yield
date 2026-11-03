@@ -1,11 +1,11 @@
-"""Batch-Inspection Sweeper — the instances fan-out backlog worker.
+"""Batch-Inspection Sweeper — the scaling.copies fan-out backlog worker.
 
-auto_discover matches `batch_inspection_sweeper_agent`. With `instances: N` the
+auto_discover matches `batch_inspection_sweeper_agent`. With `scaling.copies.count: N` the
 agent runs as N parallel copies per activation; each copy calls the atomic
 `claim_inspection` tool (agency/tools.py) to pull a DISJOINT slice of the
 pending-inspection backlog, so the copies never inspect the same event. The
 @chain floor only NORMALISES the reported claim into the yields contract — the
-actual claim happened in the tool, and `instances_handoff: last` combines the
+actual claim happened in the tool, and `scaling.copies.handoff: last` combines the
 copies deterministically (lists concat, counts sum).
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ def _as_list(v: Any) -> list[str]:
 async def normalise_sweep(result: Any, context: dict) -> dict:
     """Coerce the copy's reported claim into the yields contract. `claimed_count`
     is re-derived from the ids so it can never disagree with the list (and so the
-    instances sum stays honest)."""
+    copies sum stays honest)."""
     result = result if isinstance(result, dict) else {}
     ids = _as_list(result.get("claimed_event_ids"))
     result["claimed_event_ids"] = ids
