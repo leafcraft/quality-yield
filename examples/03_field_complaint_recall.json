@@ -1,12 +1,11 @@
 {
   "_entry_point": "field_complaint",
-  "_description": "Customer-reported defect \u2014 recall_traceability_agent finds the production lot, scopes the recall.",
-  "payload": {
-    "complaint_id": "fc-2026-0604-002",
-    "customer_id": "c-acme-mfg",
-    "product_sku": "PROD-VALVE-128",
-    "serial_number": "VLV-128-2026-04-018273",
-    "defect_description": "Internal seal failure at 60% rated pressure \u2014 pressure test record attached.",
-    "potential_impact": "high"
+  "_description": "Customer ticket CS-88120 reports surface peeling after 3 weeks on unit U-2210-04417 — recall_traceability_agent traces it to shipped batch B-2210 (13,950 units in the field), scopes the recall and stamps the regulator routing.",
+  "source_event_id": "evt-complaint-2210",
+  "batch_id": "B-2210",
+  "complaint": {
+    "ticket_id": "CS-88120",
+    "unit_serial": "U-2210-04417",
+    "description": "surface peeling after 3 weeks of use"
   }
 }

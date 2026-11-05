@@ -7,11 +7,13 @@ NO connector wired:
     read_defect_record / read_prior_recalls. Each **announces itself**: when
     there is no real source and no seed, it returns `available: false` and says
     why — never a synthetic success that looks like a real read. To go live,
-    wire the LIMS/vision mcp block in config.yaml (each named action becomes its
-    own tool); these dev tools are the fallback contract.
+    create the vault record 'lims_mcp' and wire the LIMS/vision mcp block
+    (config.yaml before the first start, Studio's YAML editor after it; each
+    named action becomes its own tool); these dev tools are the fallback
+    contract. They check that vault record themselves; nothing is read from .env.
 
   * The Batch-Inspection Sweeper's ATOMIC claim — claim_inspection. With
-    `instances: N`, the copies race for the same backlog; the claim tool pops a
+    `scaling.copies.count: N`, the copies race for the same backlog; the claim tool pops a
     DISJOINT slice under a lock so no two copies inspect the same event.
 """
 import os
@@ -20,21 +22,24 @@ from leafmesh import global_tool, LeafMeshLogger
 
 try:
     from ._shared import store
+    from ._shared.wiring import vault_record_exists
 except ImportError:  # pragma: no cover — direct-run fallback
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _shared import store  # type: ignore
+    from _shared.wiring import vault_record_exists  # type: ignore
 
 logger = LeafMeshLogger(__name__)
 
 
-def _connector_wired() -> bool:
-    """True if a real inspection connector is configured (LIMS/historian URL set)."""
-    return bool(os.getenv("LIMS_MCP_URL") or os.getenv("HISTORIAN_MCP_URL"))
+async def _lims_wired() -> bool:
+    """True once the vault record 'lims_mcp' exists (Infrastructure →
+    Integrations → MCP)."""
+    return await vault_record_exists("lims_mcp")
 
 
 @global_tool(category="inspection")
-def read_batch_genealogy(batch_id: str) -> dict:
+async def read_batch_genealogy(batch_id: str) -> dict:
     """Read a batch's genealogy record — line, shift, product class, spec
     target/tolerance, incoming lots, units shipped, and the safety-critical flag.
 
@@ -47,15 +52,18 @@ def read_batch_genealogy(batch_id: str) -> dict:
     """
     batch = store.get_batch(str(batch_id).strip())
     if not batch:
-        if _connector_wired():
-            return {"available": False, "reason": "connector wired but returned nothing for this batch"}
-        return {"available": False, "reason": f"no seed batch {batch_id!r}; wire LIMS_MCP_URL"}
+        if await _lims_wired():
+            return {"available": False,
+                    "reason": "LIMS record 'lims_mcp' exists, but this dev tool reads only the seed; "
+                              "use the lims tools for this batch"}
+        return {"available": False,
+                "reason": f"no seed batch {batch_id!r}; create vault record 'lims_mcp' for the live LIMS"}
     logger.info(f"read_batch_genealogy batch={batch_id} safety_critical={batch.get('safety_critical')}")
     return {"available": True, "batch": batch, "incoming_lots": store.lots_for_batch(str(batch_id).strip())}
 
 
 @global_tool(category="inspection")
-def read_defect_record(source_event_id: str) -> dict:
+async def read_defect_record(source_event_id: str) -> dict:
     """Read the raw defect record for an inspection event — the dimensional
     measurement, scratch length, or complaint description that seeds the score.
 
@@ -64,7 +72,12 @@ def read_defect_record(source_event_id: str) -> dict:
     """
     defect = store.get_defect(str(source_event_id).strip())
     if not defect:
-        return {"available": False, "reason": f"no seed defect {source_event_id!r}; wire LIMS_MCP_URL"}
+        if await _lims_wired():
+            return {"available": False,
+                    "reason": "LIMS record 'lims_mcp' exists, but this dev tool reads only the seed; "
+                              "use the lims tools for this event"}
+        return {"available": False,
+                "reason": f"no seed defect {source_event_id!r}; create vault record 'lims_mcp' for the live LIMS"}
     return {"available": True, "defect": defect}
 
 
@@ -83,7 +96,7 @@ def read_prior_recalls(batch_id: str) -> dict:
 @global_tool(category="inspection")
 def claim_inspection(count: int = 1) -> dict:
     """Atomically claim up to `count` pending inspection events from the backlog
-    for THIS sweeper copy. The claim is disjoint across parallel `instances`
+    for THIS sweeper copy. The claim is disjoint across parallel
     copies (a lock-protected pop), so no two copies inspect the same event.
 
     Returns the claimed event ids and the remaining backlog size, or

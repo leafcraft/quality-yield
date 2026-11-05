@@ -13,8 +13,8 @@ are unchanged:
   * CAPA register           → QMS corrective-action log
   * Prior recalls           → QMS recall register / regulatory filings
 
-Setting HISTORIAN_MCP_URL / QMS_MCP_URL alone does nothing until you
-wire the calls here.
+Creating a vault record (lims_mcp / qms_mcp / a historian connection)
+alone does nothing here until you wire the calls.
 
 This is a SEEDED dev store, never the system of record (Rule 7): it
 ships realistic batches + lots, one in-line defect, a SPC series with a
@@ -115,12 +115,12 @@ _SEED_BATCHES: dict[str, Any] = {
 _SEED_LOTS: dict[str, Any] = {
     "LOT-TI-9920": {
         "lot_id": "LOT-TI-9920", "material": "Ti-6Al-4V bar stock",
-        "supplier_id": "SUP-TITANCORP", "coa_status": "out_of_spec",
+        "supplier_id": "SUP-WESTBROOK-ALLOYS", "coa_status": "out_of_spec",
         "received": "2026-06-18", "batches_consumed": ["B-4470", "B-4471"],
     },
     "LOT-PLA-5510": {
         "lot_id": "LOT-PLA-5510", "material": "PLA pellet",
-        "supplier_id": "SUP-POLYMERX", "coa_status": "in_spec",
+        "supplier_id": "SUP-LARKSPUR-POLYMERS", "coa_status": "in_spec",
         "received": "2026-04-28", "batches_consumed": ["B-3300", "B-2210"],
     },
 }
@@ -140,11 +140,23 @@ _SEED_DEFECTS: dict[str, Any] = {
         },
         "received_at_utc": "2026-06-22T14:02:11+00:00",
     },
+    # A cosmetic, in-tolerance finish deviation on a consumer batch — the
+    # low-severity path (first-line check by the QA Inspector).
+    "evt-vision-3300": {
+        "source_event_id": "evt-vision-3300", "batch_id": "B-3300",
+        "line_id": "L3", "source": "vision",
+        "raw_signal": {
+            "camera": "CAM-L3-01", "measure": "surface_finish",
+            "value": 1.92, "spec_target": 1.6, "spec_tolerance": 0.4,
+            "image_id": "img-3300-10452", "note": "light flow lines on 14 units",
+        },
+        "received_at_utc": "2026-06-20T11:26:40+00:00",
+    },
     "evt-complaint-2210": {
         "source_event_id": "evt-complaint-2210", "batch_id": "B-2210",
         "line_id": "L3", "source": "complaint",
         "raw_signal": {
-            "channel": "support_ticket", "ticket_id": "ZD-88120",
+            "channel": "support_ticket", "ticket_id": "CS-88120",
             "description": "surface peeling after 3 weeks of use",
             "unit_serial": "U-2210-04417",
         },
@@ -183,7 +195,7 @@ _SEED_CAPAS: dict[str, Any] = {
     "CAPA-2026-0188": {
         "capa_id": "CAPA-2026-0188", "line_id": "L7",
         "primary_cause": "process",
-        "summary": "Press setpoint drift on L7 — recalibrate weekly",
+        "summary": "Boring-spindle thermal drift on L7 — re-zero the bore gauge each shift",
         "status": "open", "owner": "plant_engineer",
         "opened_at_utc": "2026-06-15T09:00:00+00:00",
         "due_at_utc": "2026-06-29T00:00:00+00:00", "effective": None,
@@ -208,8 +220,13 @@ _SEED_RECALLS: list[dict[str, Any]] = [
 ]
 
 # Pending-inspection backlog — the queue the scheduled Batch-Inspection Sweeper
-# fans out over (instances). Each id is a pending inspection event; the atomic
+# fans out over (scaling.copies). Each id is a pending inspection event; the atomic
 # claim pops a disjoint slice per copy. PROD: the LIMS/vision inspection queue.
+# Four events, one per route: a safety-critical dimensional defect (B-4471 →
+# quarantine + release authority), a cosmetic in-tolerance finish (B-3300 →
+# QA Inspector), a field complaint on a shipped batch (B-2210 → recall trace),
+# and `evt-spc-l7`, which the LIMS has no record of yet — the missing-data case
+# (the evidence read says available:false; nothing is guessed).
 _SEED_PENDING_INSPECTIONS: list[str] = [
     "evt-vision-4471", "evt-complaint-2210", "evt-vision-3300", "evt-spc-l7",
 ]
@@ -381,7 +398,7 @@ def record_recall(row: dict[str, Any]) -> None:
         _save("recalls", s)
 
 
-# ── Pending-inspection backlog (the Sweeper's instances fan-out source) ──────
+# ── Pending-inspection backlog (the Sweeper's copies fan-out source) ──────
 def _pending() -> list[str]:
     s = _load("pending_inspections")
     if not s:
@@ -433,6 +450,39 @@ def get_disposition_round(batch_id: str) -> int:
     if not batch_id:
         return 0
     return int(_load("disposition_rounds").get(batch_id, 0))
+
+
+# ── Release signatures (the two-signature rule on safety-critical batches) ────
+def record_release_signature(batch_id: str, seat: str, operator_id: str = "") -> list[dict[str, Any]]:
+    """Record one release signature for a batch and return all of them.
+    PROD: the QMS / eDHR e-signature record (21 CFR Part 11)."""
+    if not batch_id:
+        return []
+    with _LOCK:
+        s = _load("release_signatures")
+        rows = list(s.get(batch_id, []))
+        rows.append({"seat": str(seat or ""), "operator_id": str(operator_id or ""),
+                     "signed_at_utc": _now()})
+        s[batch_id] = rows
+        _save("release_signatures", s)
+    return rows
+
+
+def clear_release_signatures(batch_id: str) -> None:
+    """A quarantine, rework, hold or rejection voids every earlier release
+    signature on the batch: the next release starts from none."""
+    if not batch_id:
+        return
+    with _LOCK:
+        s = _load("release_signatures")
+        if s.pop(batch_id, None) is not None:
+            _save("release_signatures", s)
+
+
+def release_signatures(batch_id: str) -> list[dict[str, Any]]:
+    if not batch_id:
+        return []
+    return list(_load("release_signatures").get(batch_id, []))
 
 
 # ── Release outbox + append-only ledger (the finisher's records) ─────────────

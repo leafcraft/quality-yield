@@ -19,8 +19,8 @@ Three patterns, each serving a real domain need:
 
 INGEST: `mode: ingest` appends one measurement to the store window. In
 production measurements live in your historian — feed `spc_measurement_
-ingest` from it, or swap this agent to an mcp connector following the
-${HISTORIAN_MCP_URL:} pattern.
+ingest` from it, or swap this agent to an mcp connector that picks a
+vault connection (its address lives there, never in config).
 """
 from __future__ import annotations
 
