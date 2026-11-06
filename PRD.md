@@ -13,11 +13,15 @@ pass. The case routes simultaneously to the **Quality Engineer** (root cause +
 CAPA draft) and to the **Batch Disposition & Release finisher**, which routes the
 batch to the **QA Manager** — the only batch-release authority. The manager
 decides; the finisher re-checks the verdict (fail-closed), re-derives the safety
-invariant in code (a safety-critical batch never ships on this path), and records
-the outcome. A low-severity cosmetic defect would instead route to the **QA
-Inspector** for a first-line check. A daily SPC sweep, a scheduled backlog fan-out
-(`instances`), and customer field complaints feed the same authority and the same
-hash-chained audit terminus. Stalls escalate to the **Quality Director**.
+invariant in code (a safety-critical batch needs a second signature), and records
+the outcome. Because `B-4471` is safety-critical, the QA Manager's `release` is
+only the first signature: the finisher then asks the **Quality Director** and
+issues the certificate only after two different people have signed. A
+low-severity cosmetic defect would instead route to the **QA Inspector** for a
+first-line check. A daily SPC sweep, a scheduled backlog fan-out
+(`scaling.copies`), and customer field complaints feed the same authority and the same
+hash-chained audit terminus. A Class I/II recall goes to the **Quality
+Director**; repeated agent failures reach the Director through the Manager.
 
 ## Pod shape
 
@@ -32,7 +36,8 @@ Coordinator + specialists + finisher + human members + supervisor:
 - **Human members** — `qa_manager_human` (batch-release authority),
   `qa_inspector_human`, `plant_engineer_human`, `quality_director_human`
   (accountable owner).
-- **Supervisor** — the LeafMesh Manager, escalating to the Quality Director.
+- **Supervisor** — the LeafMesh Manager, escalating to the Quality Director on
+  non-retryable errors, 5 failed agents in one case, or exhausted restarts.
 
 ## Flow
 
@@ -51,15 +56,19 @@ Coordinator + specialists + finisher + human members + supervisor:
                                                └ pass/clear/held ─▶ audit
  batch_release_agent ── status routed ─────▶ qa_manager_human
                         status exhausted ──▶ quality_director_human   (bounded back-edge terminal)
+                        awaiting_second_signature ─▶ the seat still to sign (QA Manager / Quality Director)
                         always ────────────▶ qa_audit_logger_agent
- qa_manager_human ── release ──────────────▶ batch_release_agent (issue certificate)
+ qa_manager_human ── release ──────────────▶ batch_release_agent (issue certificate; 1st signature if safety-critical)
+ quality_director_human ── release ────────▶ batch_release_agent (2nd signature)
+                           quarantine/acknowledged/held ─▶ qa_audit_logger_agent
                      rework ───────────────▶ quality_engineer_agent  (bounded back-edge)
                      held/quarantine/halt ─▶ qa_audit_logger_agent
- scheduled_batch_inspection ─▶ batch_inspection_sweeper_agent (instances:3, claim_inspection) ─▶ inspection_intake_agent
+ scheduled_batch_inspection ─▶ batch_inspection_sweeper_agent (copies.count:3, claim_inspection) ─▶ inspection_intake_agent
  spc_* ─▶ spc_monitor_agent ── out-of-control ─▶ plant_engineer_human
  capa_* ─▶ corrective_action_tracker_agent ─▶ qa_audit_logger_agent
  field_complaint / customer_complaint / regulatory_batch_audit / orchestrate_recall ─▶ recall_traceability_agent
-                     recall/exec ─▶ qa_manager_human   ;   trace-only ─▶ qa_audit_logger_agent
+                     Class I/II (exec) ─▶ quality_director_human ; other recall ─▶ qa_manager_human
+                     trace-only ─▶ qa_audit_logger_agent
  regulatory_audit_readiness ─▶ regulatory_compliance_agent
                      requires_capa ─▶ quality_engineer_agent
                      manager review ─▶ qa_manager_human
@@ -75,7 +84,7 @@ Coordinator + specialists + finisher + human members + supervisor:
 | `qa_coordinator_agent` | QA Case Coordinator | llm (pure-YAML) |
 | `inspection_intake_agent` | Incoming-Quality Inspector / Defect Classifier | llm + super_agent + playbook + tools + module |
 | `quality_engineer_agent` | Quality Engineer | llm (thinking) + playbook + module |
-| `batch_inspection_sweeper_agent` | Batch-Inspection Sweeper | llm (instances:3) + tools + module |
+| `batch_inspection_sweeper_agent` | Batch-Inspection Sweeper | llm (scaling.copies.count:3) + tools + module |
 | `spc_monitor_agent` | SPC / Process-Control Analyst | programmatic (cron) + module |
 | `recall_traceability_agent` | Recall & Traceability Officer | llm + playbook + module |
 | `regulatory_compliance_agent` | Regulatory Compliance Officer | llm + module |
@@ -121,10 +130,15 @@ register (`capa_open`, `capa_update`, `capa_report`); HITL resume
   decides, the system records; no stage advances on an agent's own authority.
 - **Every wire conditional** — a bare unconditional edge is a smell; the only
   `always` edges are the audit termini.
-- **Default-deny human gates** — all four humans set `fallback_on_timeout: true`
-  with `human_message: held_for_review`; silence never releases a batch. `dual`
+- **Nothing released on silence** — a request nobody answers closes its Inbox
+  card and the ticket records that no reply came; nobody is chased
+  automatically. All four humans keep `fallback_on_timeout: true` with
+  `human_message: held_for_review` as the declared intent (leafmesh 2.4.486 does
+  not route it for dual seats yet). Every answer value has a route. `dual`
   lives on the human boundary only; no human calls another human (dual→dual
-  ping-pong) — human→human escalation is the Manager's job.
+  ping-pong) — the finisher carries a batch from one signer to the next.
+- **Two signatures on a safety-critical release** — QA Manager first, Quality
+  Director second, two different people when the Inbox records who answered.
 - **The finisher** — re-checks the release (allow/deny tokens, unknown fails
   closed), re-derives the safety invariant in code, renders the certificate to
   `./out`, deletes on a tripped floor, records the ledger. Bounds the rework loop
@@ -135,15 +149,15 @@ register (`capa_open`, `capa_update`, `capa_report`); HITL resume
   (recall + regulatory `@chain`, shared tables); fail-closed release actuator +
   idempotency (`_shared/batch_release`).
 - **WORM audit terminus** — every terminal path lands in `qa_audit_logger_agent`
-  (hash-chained, insertion/deletion-detectable), including gates held on timeout.
+  (hash-chained, insertion/deletion-detectable).
 - **Mesh boundary** — customers are never members; complaints enter via entry
   points; CAPAs/filings leave via connectors (all `${VAR:}` empty-default, inert
   until wired).
 
 ## Modern capabilities
 
-- **instances** — `batch_inspection_sweeper_agent: instances: 3` +
-  `instances_handoff: last`; the atomic `claim_inspection` tool splits the
+- **scaling.copies** — `batch_inspection_sweeper_agent: scaling.copies.count: 3` +
+  `scaling.copies.handoff: last`; the atomic `claim_inspection` tool splits the
   pending-inspection backlog so copies never duplicate work. Yields are
   lists+counts only, so the deterministic merge (concat / sum) stays honest.
 - **timezone** — every live `wake_up` declares `timezone` (plant time), so crons
@@ -152,18 +166,19 @@ register (`capa_open`, `capa_update`, `capa_report`); HITL resume
 - **playbook** — per-intent craft (intake / engineer / recall): `description` in
   the prompt, `responsibility` loaded on demand (never duplicated into the prompt).
 - **mcp** — declared but commented on intake (LIMS) and the CAPA tracker (QMS);
-  an empty-url mcp block is rejected at load, so dev-store tools carry day-0.
+  each picks a vault connection (`lims_mcp`, `qms_mcp`) created on
+  Infrastructure → Integrations → MCP, so dev-store tools carry day-0.
 
 ## Config pointer
 
-`configs/config.yaml` is the department. `agency/*_agent.py` bind by name
+The agency's configuration is the department (`create-leafmesh --start` loads it into the store once; after that it is changed in Studio). `agency/*_agent.py` bind by name
 (auto_discover): the coordinator is pure-YAML; intake / engineer / SPC / recall /
 regulatory / sweeper / finisher / CAPA-tracker carry modules; `_shared/` holds
 the deterministic helpers (`store`, `spc_math`, `defect_scoring`, `batch_release`,
 `session_stash`, `audit_logger`). `agency/tools.py` registers the day-0 tools
 (evidence reads + the atomic claim). `main.py` imports `agency.tools` before
-`from_yaml`, then registers the WORM sink. `validate_config.py` checks targets,
-conditions, the yields↔prompt contract, cron shape, and module reconciliation.
+`from_store()`, then registers the WORM sink. `leafmesh config check` runs the
+SDK's own checks on the stored configuration.
 
 ## Reflection / decisions
 
@@ -171,12 +186,12 @@ conditions, the yields↔prompt contract, cron shape, and module reconciliation.
   to human gates; the pod now owns the case in a coordinator and puts the
   artifact-producing executor *behind* the batch-release gate, so a release is a
   re-checked, fail-closed actuation, not a hand-off.
-- **No dual→dual** — humans route only to chain/programmatic/external agents;
-  human→human escalation goes through the Manager supervisor (0 dual warnings).
+- **No dual→dual** — humans route only to chain/programmatic/external agents
+  (0 dual warnings); the second signature travels through the finisher.
 - **Bounded back-edge** — the rework loop (manager → engineer → finisher →
   manager) is bounded by a per-batch round counter that terminates at the Quality
   Director.
-- **instances on a dedicated sweeper** — fan-out lives on the backlog sweeper (its
+- **copies on a dedicated sweeper** — fan-out lives on the backlog sweeper (its
   yields are lists+counts that merge cleanly), never on the per-case classifier
   (whose severity would wrongly sum across copies).
 - **State out of the template** — CAPAs → QMS (mcp, commented), measurements →

@@ -1,12 +1,12 @@
 """quality-yield — Quality & Yield Pod (LeafMesh).
 
 Boot order matters (SDK 2.4.131):
-  1. import agency.tools  -> the @global_tool decorators run BEFORE from_yaml/
+  1. import agency.tools  -> the @global_tool decorators run BEFORE from_store/
      start, so intake's read_batch_genealogy / read_defect_record /
      read_prior_recalls and the sweeper's claim_inspection are registered.
-  2. LeafMesh.from_yaml(...) -> auto_discover wires agency/*_agent.py to the YAML.
+  2. LeafMesh.from_store() -> auto_discover wires agency/*_agent.py to the YAML.
   3. audit_logger.register(...) -> attach the WORM sink to the custom external
-     qa_audit_logger_agent (must be after from_yaml, before start).
+     qa_audit_logger_agent (must be after from_store, before start).
   4. leafmesh.start().
 
 Python lives only where it must: the deterministic floors (defect scoring, SPC
@@ -26,7 +26,7 @@ from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external qa_audit_logger_agent (SDK 2.4+ API).
@@ -45,8 +45,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.MANAGER_INTERVENTION, _on_manager_intervention)
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED, _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT, _on_human_input_timeout)
-    try: await leafmesh.enable_self_healing()
-    except AttributeError: pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
     logger.info("quality-yield — Quality & Yield mesh running")
 
     stop = asyncio.Event(); loop = asyncio.get_running_loop()

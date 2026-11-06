@@ -1,7 +1,7 @@
 """regulatory_compliance_agent — audit-readiness + the regulator-routing
 + statutory filing-window floor.
 
-The LLM (configs/config.yaml) does the judgement: build the per-framework
+The LLM (defined in the configuration) does the judgement: build the per-framework
 audit-readiness scorecard (evidence inventory vs requirements → CAPA
 recommendations). This micro-module owns the deterministic compliance
 pieces:
