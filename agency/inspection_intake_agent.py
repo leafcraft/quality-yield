@@ -1,6 +1,6 @@
 """inspection_intake_agent — context pull + the disposition floor.
 
-The LLM (configs/config.yaml) normalises the raw signal and proposes a
+The LLM (defined in the configuration) normalises the raw signal and proposes a
 defect_class / severity / quarantine recommendation + the QA briefing.
 This micro-module owns the two things the LLM must NOT be trusted to do:
 

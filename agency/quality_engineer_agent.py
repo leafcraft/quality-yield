@@ -1,6 +1,6 @@
 """quality_engineer_agent — context pull + the CAPA-required floor.
 
-The LLM (configs/config.yaml) does the judgement: correlate the defect to
+The LLM (defined in the configuration) does the judgement: correlate the defect to
 its root cause(s) and draft the CAPA narrative. This micro-module owns
 the deterministic pieces:
 

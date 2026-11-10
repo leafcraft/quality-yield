@@ -1,11 +1,6 @@
 {
   "_entry_point": "report_signal",
-  "_description": "QA pulls a sample batch \u2014 inspection_intake records + classifies no defects, batch released.",
-  "payload": {
-    "batch_id": "batch-2026-W23-0091",
-    "line_id": "line-portland-04",
-    "source": "qa_sample",
-    "sample_size": 30,
-    "lot_size": 480
-  }
+  "_description": "Routine vision check on consumer batch B-3300 finds light flow lines inside the finish tolerance (1.92 vs 1.6 ± 0.4 Ra) — intake scores it cosmetic / low severity and the QA Inspector does the first-line check (pass / clear / escalate).",
+  "source_event_id": "evt-vision-3300",
+  "batch_id": "B-3300"
 }

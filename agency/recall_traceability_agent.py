@@ -1,6 +1,6 @@
 """recall_traceability_agent — trace context + regulator-routing floor.
 
-The LLM (configs/config.yaml) does the judgement: trace the complaint to
+The LLM (defined in the configuration) does the judgement: trace the complaint to
 a batch, scope the recall, set the severity class and the escalation /
 notification flags, draft the customer-facing response. This micro-module
 owns the deterministic compliance pieces:

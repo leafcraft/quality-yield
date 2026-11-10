@@ -1,6 +1,6 @@
 """quality-yield — agency package (Rule 1).
 
-YAML-FIRST: the department is configs/config.yaml. Python lives only
+YAML-FIRST: the department is the configuration. Python lives only
 where a role needs hands — a deterministic floor the LLM can't waive, a
 self-reliant context pull, domain math, or a fail-closed actuator:
 

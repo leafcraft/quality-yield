@@ -1,19 +1,6 @@
 {
   "_entry_point": "report_signal",
-  "_description": "Inspection finds 4 defective units in one sample \u2014 inspection_intake classifies the cluster, quality_engineer runs 5-whys and drafts the CAPA.",
-  "payload": {
-    "batch_id": "batch-2026-W23-0094",
-    "line_id": "line-portland-04",
-    "source": "qa_sample",
-    "sample_size": 30,
-    "lot_size": 480,
-    "defects_observed": [
-      {
-        "type": "surface_finish",
-        "count": 4,
-        "severity": "moderate"
-      }
-    ],
-    "operator_notes": "All 4 defects on units processed after 14:00 \u2014 possible heating-element drift on milling station 3."
-  }
+  "_description": "Vision flags a bore diameter of 10.071 mm on B-4471 (spec 10.00 ± 0.05) — a safety-critical medical-device batch: intake's hard-stop forces quarantine + max severity, the engineer traces it to the out-of-spec titanium lot and drafts a CAPA, and the finisher routes the batch to the QA Manager. A QA Manager release is only the first signature; the Quality Director signs second.",
+  "source_event_id": "evt-vision-4471",
+  "batch_id": "B-4471"
 }

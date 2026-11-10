@@ -9,8 +9,14 @@ concrete "@chain fails closed":
   a) release RE-CHECK — reaching this agent does not mean released. An allow-token
      allowlist + block-token denylist; an UNKNOWN verdict fails closed.
   b) deterministic invariants a human can't waive — a batch on record, and the
-     fail-closed actuator (agency/_shared/batch_release.py) that NEVER ships a
-     safety-critical batch on this path and is idempotent per batch+decision.
+     fail-closed actuator (agency/_shared/batch_release.py), idempotent per
+     batch+decision.
+  b2) TWO SIGNATURES on a safety-critical batch — the QA Manager's release is
+     the first signature; the batch then waits for the Quality Director's
+     (status `awaiting_second_signature`, second_signer names the missing
+     seat). It ships only when both seats have released it, and — when the
+     Inbox records who answered — two different people. The same person
+     signing twice blocks the release.
   c) render the real certificate to ./out; on a tripped floor, DELETE the partial
      and record `status: blocked` with reasons — never a half-released batch.
   d) dev-store recovery — after the HITL gate the upstream payload is dropped, so
@@ -19,7 +25,8 @@ concrete "@chain fails closed":
 Phases: phase 1 (from intake / the engineer) routes the batch to the QA manager
 for a decision, and BOUNDS the rework loop — a batch that loops on rework past
 its round bound routes to the Quality Director (a terminal). Phase 2 (from the
-manager, released) issues the certificate.
+manager, released) issues the certificate — after the second signature when
+the batch is safety-critical.
 """
 from __future__ import annotations
 
@@ -40,6 +47,8 @@ _RELEASE_TOKENS = frozenset({"release", "released", "approve", "approved", "ship
 _BLOCK_TOKENS = frozenset({"quarantine", "rework", "halt", "hold", "held",
                            "held_for_review", "reject", "rejected", "no", "deny", "denied"})
 MAX_DISPOSITION_ROUNDS = 3
+# The two seats whose `release` counts as a signature on a safety-critical batch.
+RELEASE_SEATS = ("qa_manager_human", "quality_director_human")
 
 
 def _now() -> str:
@@ -70,6 +79,53 @@ def _is_released(input_data: dict) -> bool:
 
 def _is_blocked(input_data: dict) -> bool:
     return _signal(input_data) in _BLOCK_TOKENS
+
+
+def _signer(input_data: dict) -> tuple[str, str]:
+    """(seat, operator_id) of the person whose reply reached the finisher —
+    the SDK stamps every human reply with source_agent + operator_id."""
+    sources = [input_data]
+    up = input_data.get("upstream_yields")
+    if isinstance(up, dict):
+        sources.append(up)
+        sources.extend(v for v in up.values() if isinstance(v, dict))
+    for src in sources:
+        seat = src.get("source_agent")
+        if isinstance(seat, str) and seat:
+            return seat, str(src.get("operator_id") or "")
+    return "", ""
+
+
+# Values that name nobody in particular (the Inbox's fallback when a reply
+# carries no login).
+_UNKNOWN_SIGNERS = frozenset({"", "operator", "system", "unknown", "anonymous"})
+
+
+def signature_status(signatures: list[dict]) -> dict[str, Any]:
+    """The two-signature rule for a safety-critical batch. Pure; testable.
+
+    complete     — both RELEASE_SEATS signed, by two identified, different people.
+    conflict     — the same person signed for both seats (four-eyes broken).
+    unidentified — seats whose signer is not recorded (no login on the reply,
+                   or the Inbox's generic name): two different people cannot be
+                   proven, so the batch does not ship.
+    missing      — the seat still to sign ("" when both have signed).
+    """
+    by_seat: dict[str, set[str]] = {}
+    for s in signatures or []:
+        seat = str(s.get("seat") or "")
+        if seat in RELEASE_SEATS:
+            by_seat.setdefault(seat, set()).add(str(s.get("operator_id") or "").strip().lower())
+    missing = next((seat for seat in RELEASE_SEATS if seat not in by_seat), "")
+    if missing:
+        return {"complete": False, "conflict": False, "unidentified": [], "missing": missing}
+    people = {seat: by_seat[seat] - _UNKNOWN_SIGNERS for seat in RELEASE_SEATS}
+    unidentified = [seat for seat in RELEASE_SEATS if not people[seat]]
+    if unidentified:
+        return {"complete": False, "conflict": False, "unidentified": unidentified, "missing": ""}
+    if people["qa_manager_human"] & people["quality_director_human"]:
+        return {"complete": False, "conflict": True, "unidentified": [], "missing": ""}
+    return {"complete": True, "conflict": False, "unidentified": [], "missing": ""}
 
 
 def _recover_case(input_data: dict, context: dict) -> dict:
@@ -134,6 +190,7 @@ def _delete_partial(result: dict) -> None:
 def _clean(result: dict) -> dict:
     result.pop("_input", None)
     result.pop("_case", None)
+    result.pop("_signoff", None)
     return result
 
 
@@ -145,10 +202,13 @@ def enforce_release_floor(result: Any, context: dict) -> dict:
     result.setdefault("disposition", "")
     result.setdefault("released", False)
 
-    if result.get("status") in ("routed", "exhausted"):
-        return _clean(result)  # phase 1: routed / terminated — nothing to issue
+    if result.get("status") in ("routed", "exhausted", "awaiting_second_signature"):
+        return _clean(result)  # routed / terminated / waiting for a signature — nothing to issue
 
     if not result.get("released"):
+        if result.get("status") == "blocked" and result["block_reasons"]:
+            _delete_partial(result)              # the body already said why
+            return _clean(result)
         result["status"] = "blocked"
         if _is_blocked(result.get("_input", {})):
             result["block_reasons"].append("authority quarantined / reworked / held")
@@ -167,9 +227,10 @@ def enforce_release_floor(result: Any, context: dict) -> dict:
         return _clean(result)
 
     # Deterministic actuation — fail-closed + idempotent + safety hard-stop. The
-    # actuator never ships a safety-critical batch on this path.
+    # actuator ships a safety-critical batch only with the two-signature sign-off.
     act = enact_disposition(batch_id, "release",
-                            safety_critical=bool(case.get("safety_critical") or case.get("safety_hard_stop")))
+                            safety_critical=bool(case.get("safety_critical") or case.get("safety_hard_stop")),
+                            safety_signoff=bool(result.get("_signoff")))
     if not act.get("shipped"):
         result.update(status="blocked", released=False)
         result["block_reasons"].append(act.get("reason") or "actuator withheld release")
@@ -198,19 +259,49 @@ async def batch_release_agent(llm_response: Any, input_data: dict, context: dict
     if case.get("batch_id"):
         stash_put(sid, case)   # keep it recoverable across the release gate
 
+    batch_id = str(case.get("batch_id") or "")
     out: dict[str, Any] = {
         "routed_for_disposition": False, "released": False, "disposition": "",
         "certificate_path": "", "status": "", "block_reasons": [],
-        "batch_id": str(case.get("batch_id") or ""),
+        "second_signer": "", "batch_id": batch_id,
         "_input": input_data, "_case": case,
     }
 
-    if _is_released(input_data):
+    if _is_released(input_data) and (case.get("safety_critical") or case.get("safety_hard_stop")):
+        # Safety-critical: the release is a SIGNATURE; it ships on the second.
+        seat, operator_id = _signer(input_data)
+        if seat in RELEASE_SEATS and batch_id:
+            signatures = store.record_release_signature(batch_id, seat, operator_id)
+        else:
+            signatures = store.release_signatures(batch_id)
+        st = signature_status(signatures)
+        if st["complete"]:
+            out["released"] = True                  # the floor issues it
+            out["_signoff"] = True
+        elif st["unidentified"]:
+            out["status"] = "blocked"
+            out["disposition"] = "release"
+            out["block_reasons"].append(
+                f"who signed as {', '.join(st['unidentified'])} is not recorded — a safety-critical "
+                f"release needs both signers identified (give each seat its operator_ids)")
+        elif st["conflict"]:
+            out["status"] = "blocked"
+            out["disposition"] = "release"
+            out["block_reasons"].append("the same person signed as QA Manager and Quality Director "
+                                        "— a safety-critical release needs two different people")
+        else:
+            out["status"] = "awaiting_second_signature"
+            out["second_signer"] = st["missing"]
+            logger.info(f"[batch-release] {batch_id} safety-critical: signature recorded, "
+                        f"waiting for {st['missing']}")
+    elif _is_released(input_data):
         out["released"] = True                      # phase 2 — the floor issues it
     elif _is_blocked(input_data):
         out["status"] = "blocked"
         out["disposition"] = _signal(input_data)
+        store.clear_release_signatures(batch_id)    # earlier signatures are void
     else:
+        store.clear_release_signatures(batch_id)    # a new disposition round starts unsigned
         # phase 1 — route to the authority, bounding the rework loop.
         rounds = store.bump_disposition_round(str(case.get("batch_id") or ""))
         if rounds > MAX_DISPOSITION_ROUNDS:

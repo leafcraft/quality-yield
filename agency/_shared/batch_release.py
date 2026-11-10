@@ -6,8 +6,10 @@ MES/ERP. Two properties that MUST be code, not prompt:
   * FAIL-CLOSED — the only decision that ships a batch is an explicit
     `release` from the batch-release authority (qa_manager). Anything
     else — quarantine, rework, halt, an unrecognised verdict, a missing
-    decision, a batch flagged safety_critical without an explicit
-    release — holds the batch. The default is NOT to ship.
+    decision, a safety-critical batch without the second signature
+    (safety_signoff, set by the finisher only when the QA Manager AND the
+    Quality Director, two different people, both released it) — holds the
+    batch. The default is NOT to ship.
 
   * IDEMPOTENT — a batch_id+decision is enacted at most once. A duplicate
     resume after a HITL gap (or a retried chain) returns the prior
@@ -50,12 +52,13 @@ def _dispatch(batch_id: str, action: str) -> str:
 
 
 def enact_disposition(batch_id: str, decision: str, *,
-                      safety_critical: bool = False) -> dict[str, Any]:
+                      safety_critical: bool = False,
+                      safety_signoff: bool = False) -> dict[str, Any]:
     """Enact a batch disposition, fail-closed + idempotent.
 
     Returns {batch_id, enacted_action, shipped, actuation_id, idempotent,
-    reason}. `shipped` is True ONLY for an explicit release of a batch
-    that is not safety-critical-without-release.
+    reason}. `shipped` is True ONLY for an explicit release — and, for a
+    safety-critical batch, only with `safety_signoff` (two signatures).
     """
     batch_id = str(batch_id or "")
     decision = str(decision or "").strip().lower()
@@ -64,11 +67,10 @@ def enact_disposition(batch_id: str, decision: str, *,
     if decision not in _KNOWN_VERDICTS:
         reason = f"unrecognised verdict {decision!r} → hold (fail-closed)"
         action = "halt"
-    elif decision == _RELEASE_VERDICT and safety_critical:
-        # A safety-critical batch cannot be released by this actuator's
-        # default path — it requires the explicit safety sign-off the
-        # caller must have already cleared; absent that, hold.
-        reason = "safety_critical batch — release withheld pending safety sign-off"
+    elif decision == _RELEASE_VERDICT and safety_critical and not safety_signoff:
+        # A safety-critical batch ships only with the second signature the
+        # finisher verified (QA Manager + Quality Director, two people).
+        reason = "safety_critical batch — release withheld pending the second signature"
         action = "halt"
     else:
         reason = f"enacted {decision}"

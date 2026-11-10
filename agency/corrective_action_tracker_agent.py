@@ -1,8 +1,9 @@
 """CAPA Register Coordinator — the dev-store CAPA register (programmatic).
 
 auto_discover matches `corrective_action_tracker_agent`. CAPAs belong in YOUR
-QMS; the config ships the mcp connector COMMENTED (an empty-url connector is
-rejected at load), so this module runs the register off the seeded dev store
+QMS; the config ships the mcp connector COMMENTED (it picks the vault
+connection 'qms_mcp', which day 0 does not have), so this module runs the
+register off the seeded dev store
 (agency/_shared/store.py) day-0. Swap the store bodies for QMS calls and the
 mesh is unchanged.
 
