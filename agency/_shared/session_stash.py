@@ -2,13 +2,13 @@
 
 Two jobs:
 
-1. Bridge the human gate. When a QA manager / inspector / plant engineer
+1. Bridge the human step. When a QA manager / inspector / plant engineer
    approves in the Studio inbox, the SDK resumes the chain with ONLY the
    human-response meta fields (human_message, human_decision, …) — the
    batch/defect payload that was flowing is not re-delivered to the next
    agent. The last pre-gate agent stashes the full batch + decision
    context here, keyed by session_id, so the batch-release actuator and
-   the audit sink can recover it after the gate.
+   the audit sink can recover it after the decision.
 
 2. Bound rework loops. The qa_manager → plant_engineer rework back-edge
    is a counted loop: the stash holds a per-session rework counter so a

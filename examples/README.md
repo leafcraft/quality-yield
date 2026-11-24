@@ -20,7 +20,7 @@ batches, events and tickets below are seeded records.
 - **03_field_complaint_recall** — `field_complaint` — ticket `CS-88120`, surface peeling on shipped batch `B-2210` (13,950 units in the field) — recall_traceability_agent scopes the recall and stamps the regulator routing.
 - **04_regulatory_audit_pull** — `regulatory_batch_audit` — an FDA inspector asks for the chain of custody of `B-4470` / `B-4471` (both built from titanium lot `LOT-TI-9920`) — assemble the traceability dossier.
 
-## Human gates
+## Human steps
 
 The gates answer in **Studio → Inbox**. If nobody answers in time, the card
 closes and the ticket records that no reply came — nothing is released on

@@ -48,8 +48,8 @@ across the pending-inspection queue in parallel copies, and a customer field
 complaint opens a recall trace — all feeding the same release authority and the
 same audit terminus. A Class I/II recall goes to the **Quality Director**, the
 accountable owner; repeated agent failures reach the Director through the
-Manager supervisor. A request nobody answers is not escalated: its Inbox card
-closes and the ticket records that no reply came — nothing ships on silence.
+Manager supervisor. A request nobody answers is not escalated: the seat's
+default reply, `hold`, is recorded in the audit log — nothing ships on silence.
 
 ## Why it works in an organization
 
@@ -75,7 +75,7 @@ Three tiers, grounded in `env` + the team's configuration.
 ### Tier 1 — Boot (required to start)
 | Var | Purpose |
 |---|---|
-| `LEAFMESH_LICENSE_KEY` | Required to start the SDK. |
+| `LEAFMESH_LICENSE_KEY` | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `LEAFMESH_ENV_TOKEN` | Per-environment telemetry token (dev/staging/prod). |
 | `OPENAI_API_KEY` | `qa_coordinator_agent`, `inspection_intake_agent`, `batch_inspection_sweeper_agent`, `regulatory_compliance_agent` (gpt-4o-mini) + the Manager. |
 | `ANTHROPIC_API_KEY` | `quality_engineer_agent` + `recall_traceability_agent` run on `claude-sonnet-4-6`. |
@@ -85,7 +85,7 @@ Three tiers, grounded in `env` + the team's configuration.
 |---|---|---|
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | `localhost` / `6379` / empty | Session store. Bring your own Redis, or let `create-leafmesh --start .` start one. |
 | `QUALITY_YIELD_STORE_DIR` | `./data` | Seeded dev store (batches, lots, defects, SPC series, CAPA register, recalls, pending-inspection backlog) — the MES/LIMS/QMS/historian stand-in. Dev stub; never your system of record. |
-| *(no setting)* | Studio Inbox | The human gates answer in Studio's Inbox. To notify an external tool (Teams / Slack relay) instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |
+| *(no setting)* | Studio Inbox | The human steps answer in Studio's Inbox. To notify an external tool (Teams / Slack relay) instead, create a vault connection (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook') and set `webhook_config: {connection: <name>}` on the seat. |
 
 ### Tier 3 — Connectors (wire your systems of record)
 | Var | Required by | Purpose |
@@ -97,25 +97,25 @@ Three tiers, grounded in `env` + the team's configuration.
 
 | Agent | Role (job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `qa_coordinator_agent` | QA Case Coordinator | Opens the case, orchestrates the pod, keeps live status, single point of contact. Pure orchestration — never classifies or releases. `llm` (pure-YAML). | → `inspection_intake_agent` (open case); → `quality_director_human` (escalate) |
+| `qa_coordinator_agent` | QA Case Coordinator | Opens the case, orchestrates the pod, keeps live status, single point of contact. Pure orchestration — never classifies or releases. `llm` (pure-YAML) + playbook. | → `inspection_intake_agent` (open case); → `quality_director_human` (escalate) |
 | `inspection_intake_agent` | Incoming-Quality Inspector / Defect Classifier | Normalise any inspection signal; classify defect class + severity. `llm` + super_agent + playbook + tools; module `@pre_compose` pulls batch genealogy, `@chain` enforces the quarantine gate + safety hard-stop, `@compose` shapes per downstream. Daily intake sweep. | → `quality_engineer_agent` (real defect); → `batch_release_agent` (quarantine / severity ≥ 0.6 / safety-critical); → `qa_inspector_human` (real but low-severity, first-line) |
 | `quality_engineer_agent` | Quality Engineer | Root-cause analysis then draft a CAPA — never auto-applied. `llm` (claude-sonnet-4-6, thinking) + playbook; module `@pre_compose` pulls SPC window + lots + open CAPAs, `@chain` enforces the CAPA-required floor + dedupes the register. | → `plant_engineer_human` (multi-source / review); → `batch_release_agent` (single-source disposition); → `corrective_action_tracker_agent` (CAPA required) |
-| `batch_inspection_sweeper_agent` | Batch-Inspection Sweeper | Scheduled backlog fan-out — runs as `scaling.copies.count: 3` parallel copies, each claiming a disjoint slice of the pending-inspection queue via the atomic `claim_inspection` tool. `llm` + `@chain` normalise. Daily cron (plant timezone). | → `inspection_intake_agent` (claimed_count > 0) |
+| `batch_inspection_sweeper_agent` | Batch-Inspection Sweeper | Scheduled backlog fan-out — runs as `scaling.copies.count: 3` parallel copies, each claiming a disjoint slice of the pending-inspection queue via the atomic `claim_inspection` tool. `llm` + playbook + `@chain` normalise. Daily cron (plant timezone). | → `inspection_intake_agent` (claimed_count > 0) |
 | `spc_monitor_agent` | SPC / Process-Control Analyst | Deterministic X-bar / UCL / LCL + Western Electric rules over the measurement window. `programmatic` + module (`_shared/spc_math.py`); `@chain` out-of-control floor. Daily sweep (plant timezone). | → `plant_engineer_human` (line out of control) |
 | `recall_traceability_agent` | Recall & Traceability Officer | Trace complaints/audits to batch/line/shift; scope recalls; draft the customer response. `llm` + playbook; module `@chain` stamps regulator routing + statutory filing windows and freezes related batches (fail-closed, idempotent). | → `quality_director_human` (Class I/II — executive escalation); → `qa_manager_human` (other recalls); → `qa_audit_logger_agent` (trace-only) |
-| `regulatory_compliance_agent` | Regulatory Compliance Officer | Per-framework audit-readiness scorecard (FDA 21CFR11, ISO 13485, EU MDR, GMP, ISO 22000). `llm`; module `@chain` forces regulator routing on any reportable class. | → `quality_engineer_agent` (gaps need CAPA); → `qa_manager_human` (review); → `recall_traceability_agent` (statutory filing) |
+| `regulatory_compliance_agent` | Regulatory Compliance Officer | Per-framework audit-readiness scorecard (FDA 21CFR11, ISO 13485, EU MDR, GMP, ISO 22000). `llm` + playbook; module `@chain` forces regulator routing on any reportable class. | → `quality_engineer_agent` (gaps need CAPA); → `qa_manager_human` (review); → `recall_traceability_agent` (statutory filing) |
 | `corrective_action_tracker_agent` | CAPA Register Coordinator | Open / update / report CAPAs with effectiveness verification. `programmatic` + dev-store module; the QMS `mcp` connector ships commented. | → `qa_audit_logger_agent` (record) |
-| `batch_release_agent` | Batch Disposition & Release (the FINISHER) | The actuator behind the QA-manager gate. Re-checks the release (allow/deny tokens, unknown fails closed), re-derives the safety invariant in code, holds a safety-critical batch for the second signature, renders the certificate to `./out`, deletes on a tripped floor, records the ledger, and bounds the rework loop. `programmatic` + `@chain` release floor. | → `qa_manager_human` (route for decision, or the missing signature); → `quality_director_human` (loop exhausted, or the second signature); → `qa_audit_logger_agent` (terminus) |
-| `qa_manager_human` | QA Manager (batch-release authority) | Releases / quarantines / reworks / halts a batch; on a safety-critical batch the release is the first of two signatures. Answers within 4h. | → `batch_release_agent` (release); → `quality_engineer_agent` (rework); → `qa_audit_logger_agent` (held_for_review / quarantine / halt) |
-| `qa_inspector_human` | QA Inspector (first-line verification) | First-line check of a real but low-severity defect; escalate or clear. Answers within 2h. | → `batch_release_agent` (escalate); → `qa_audit_logger_agent` (pass / clear / held_for_review) |
-| `plant_engineer_human` | Plant Engineer | Process-side root-cause + corrective directive on the floor. Answers within a shift (6h). | → `qa_audit_logger_agent` (every answer) |
-| `quality_director_human` | Quality Director (accountable owner) | Second signature on a safety-critical release; Class I/II recall decisions; exhausted rework loops; the Manager's escalation target. Answers within 4h (same day). | → `batch_release_agent` (release); → `qa_audit_logger_agent` (quarantine / acknowledged / held_for_review) |
+| `batch_release_agent` | Batch Disposition & Release (the FINISHER) | The actuator behind the QA-manager step. Re-checks the release (allow/deny tokens, unknown fails closed), re-derives the safety invariant in code, holds a safety-critical batch for the second signature, renders the certificate to `./out`, deletes on a tripped floor, records the ledger, and bounds the rework loop. `programmatic` + `@chain` release floor. | → `qa_manager_human` (route for decision, or the missing signature); → `quality_director_human` (loop exhausted, or the second signature); → `qa_audit_logger_agent` (terminus) |
+| `qa_manager_human` | QA Manager (batch-release authority) | Releases / quarantines / reworks / halts a batch; on a safety-critical batch the release is the first of two signatures. Answers within 4h. | → `batch_release_agent` (release); → `quality_engineer_agent` (rework); → `qa_audit_logger_agent` (hold / quarantine / halt) |
+| `qa_inspector_human` | QA Inspector (first-line verification) | First-line check of a real but low-severity defect; escalate or clear. Answers within 2h. | → `batch_release_agent` (escalate); → `qa_audit_logger_agent` (pass / clear / hold) |
+| `plant_engineer_human` | Plant Engineer | Process-side root-cause + corrective directive on the floor. Answers within a shift (6h). | → `qa_audit_logger_agent` (every reply) |
+| `quality_director_human` | Quality Director (accountable owner) | Second signature on a safety-critical release; Class I/II recall decisions; exhausted rework loops; the Manager's escalation target. Answers within 4h (same day). | → `batch_release_agent` (release); → `qa_audit_logger_agent` (quarantine / acknowledged / hold) |
 | `qa_audit_logger_agent` | Quality Records Registrar | Hash-chained WORM audit of every batch decision, CAPA, and recall. `external` / `framework: custom`, registered in `main.py`. | terminal (audit terminus) |
 
 ## The finisher (`batch_release_agent`)
 
 The single most load-bearing pattern — the artifact-producing executor wired
-*after* the human gate (`agency/batch_release_agent.py`):
+*after* the human step (`agency/batch_release_agent.py`):
 
 1. **Re-checks the release** — reaching the finisher never means released. An
    allow-token allowlist (`release`, `approve`, `ship`…) + block-token denylist
@@ -161,12 +161,17 @@ calls too) or the module body — not hoped for in a prompt:
 
 ### If nobody answers
 
+The Inbox has no buttons. The person types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into one of the seat's verdicts in the Agents table.
+Anything that is not a clear decision — no, not now, wait — reads as `hold`.
+If the person answered an agent's question instead of deciding, the verdict is
+`answer` and it goes back to only the agent that asked.
+
 Each human request waits for the time in the Agents table. If nobody answers
-within it, the request waits no longer: its Inbox card closes and the ticket
-records that no reply came. Nothing is released on silence, and nobody is
-chased automatically. (Each seat's `fallback_response` — `held_for_review` →
-audit — states the intended default-deny; leafmesh 2.4.486 does not route it
-for these seats yet.) The Manager escalates to the Quality Director only on
+within it, the seat's default reply (`fallback_response`: `verdict: hold`,
+`held_for_review`) goes through its routes like any reply and is recorded in
+the audit log. Nothing is released on silence, and nobody is chased
+automatically. The Manager escalates to the Quality Director only on
 a non-retryable error, when 5 different agents fail in one case, or when
 restarts run out; a malformed hand-off only raises an alert.
 
@@ -182,7 +187,7 @@ restarts run out; a malformed hand-off only raises an alert.
   timezone) so crons don't silently fire in UTC.
 - **super_agent** — dict form on `inspection_intake_agent`
   (`{cost_ceiling, wall_clock}`).
-- **playbook** — per-intent craft on intake / engineer / recall: only the
+- **playbook** — per-intent craft on every LLM agent (coordinator / intake / engineer / sweeper / recall / regulatory): only the
   `description` rides in the prompt; the `responsibility` loads on demand.
 - **mcp** — declared but **commented**: each row picks a vault connection
   (`lims_mcp`, `qms_mcp`) that does not exist on day 0; dev-store tools carry

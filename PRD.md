@@ -32,7 +32,7 @@ Coordinator + specialists + finisher + human members + supervisor:
 - **Specialists** — `inspection_intake_agent`, `quality_engineer_agent`,
   `spc_monitor_agent`, `recall_traceability_agent`, `regulatory_compliance_agent`,
   `batch_inspection_sweeper_agent`, `corrective_action_tracker_agent`.
-- **Finisher** — `batch_release_agent` (the actuator behind the QA-manager gate).
+- **Finisher** — `batch_release_agent` (the actuator behind the QA-manager step).
 - **Human members** — `qa_manager_human` (batch-release authority),
   `qa_inspector_human`, `plant_engineer_human`, `quality_director_human`
   (accountable owner).
@@ -73,7 +73,7 @@ Coordinator + specialists + finisher + human members + supervisor:
                      requires_capa ─▶ quality_engineer_agent
                      manager review ─▶ qa_manager_human
                      statutory filing ─▶ recall_traceability_agent
- inspector_reply / manager_reply ─▶ (HITL resume into the human gates)
+ inspector_reply / manager_reply ─▶ (HITL resume into the human steps)
  qa_audit_logger_agent  [WORM, terminal]
 ```
 
@@ -130,13 +130,13 @@ register (`capa_open`, `capa_update`, `capa_report`); HITL resume
   decides, the system records; no stage advances on an agent's own authority.
 - **Every wire conditional** — a bare unconditional edge is a smell; the only
   `always` edges are the audit termini.
-- **Nothing released on silence** — a request nobody answers closes its Inbox
-  card and the ticket records that no reply came; nobody is chased
-  automatically. All four humans keep `fallback_on_timeout: true` with
-  `human_message: held_for_review` as the declared intent (leafmesh 2.4.486 does
-  not route it for dual seats yet). Every answer value has a route. `dual`
-  lives on the human boundary only; no human calls another human (dual→dual
-  ping-pong) — the finisher carries a batch from one signer to the next.
+- **Nothing released on silence** — all four humans are `chain` with a
+  `reply_reader` (`gpt-4o-mini`) that turns the typed reply into a `verdict`.
+  A request nobody answers takes `fallback_on_timeout: true` with
+  `verdict: hold` (`held_for_review`) through the seat's routes like any reply,
+  into the audit log; nobody is chased automatically. Every verdict has a
+  route; `answer` goes back to only the agent that asked. No human calls
+  another human — the finisher carries a batch from one signer to the next.
 - **Two signatures on a safety-critical release** — QA Manager first, Quality
   Director second, two different people when the Inbox records who answered.
 - **The finisher** — re-checks the release (allow/deny tokens, unknown fails
@@ -183,11 +183,11 @@ SDK's own checks on the stored configuration.
 ## Reflection / decisions
 
 - **Coordinator + finisher added** — the prior build wired specialists straight
-  to human gates; the pod now owns the case in a coordinator and puts the
+  to human steps; the pod now owns the case in a coordinator and puts the
   artifact-producing executor *behind* the batch-release gate, so a release is a
   re-checked, fail-closed actuation, not a hand-off.
-- **No dual→dual** — humans route only to chain/programmatic/external agents
-  (0 dual warnings); the second signature travels through the finisher.
+- **No human→human** — humans route only to chain/programmatic/external agents;
+  the second signature travels through the finisher.
 - **Bounded back-edge** — the rework loop (manager → engineer → finisher →
   manager) is bounded by a per-batch round counter that terminates at the Quality
   Director.
